@@ -8,12 +8,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/epoll.h>
 #include <sys/file.h>
 #include <sys/inotify.h>
@@ -21,7 +19,6 @@
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/signalfd.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -296,8 +293,6 @@ static void manager_free(Manager *manager) {
         if (!manager)
                 return;
 
-        manager->monitor = sd_device_monitor_unref(manager->monitor);
-
         udev_builtin_exit();
 
         if (manager->pid == getpid_cached())
@@ -448,13 +443,18 @@ static int worker_device_monitor_handler(sd_device_monitor *monitor, sd_device *
         assert(manager);
 
         r = worker_process_device(manager, dev);
-        if (r < 0)
-                log_device_warning_errno(dev, r, "Failed to process device, ignoring: %m");
+        if (r == -EAGAIN)
+                /* if we couldn't acquire the flock(), then proceed quietly */
+                log_device_debug_errno(dev, r, "Device currently locked, not processing.");
+        else {
+                if (r < 0)
+                        log_device_warning_errno(dev, r, "Failed to process device, ignoring: %m");
 
-        /* send processed event back to libudev listeners */
-        r = device_monitor_send_device(monitor, NULL, dev);
-        if (r < 0)
-                log_device_warning_errno(dev, r, "Failed to send device, ignoring: %m");
+                /* send processed event back to libudev listeners */
+                r = device_monitor_send_device(monitor, NULL, dev);
+                if (r < 0)
+                        log_device_warning_errno(dev, r, "Failed to send device, ignoring: %m");
+        }
 
         /* send udevd the result of the event execution */
         r = worker_send_message(manager->worker_watch[WRITE_END]);
@@ -779,21 +779,7 @@ set_delaying_seqnum:
         return true;
 }
 
-static int on_exit_timeout(sd_event_source *s, uint64_t usec, void *userdata) {
-        Manager *manager = userdata;
-
-        assert(manager);
-
-        log_error("Giving up waiting for workers to finish.");
-        sd_event_exit(manager->event, -ETIMEDOUT);
-
-        return 1;
-}
-
 static void manager_exit(Manager *manager) {
-        uint64_t usec;
-        int r;
-
         assert(manager);
 
         manager->exit = true;
@@ -808,16 +794,11 @@ static void manager_exit(Manager *manager) {
         manager->inotify_event = sd_event_source_unref(manager->inotify_event);
         manager->fd_inotify = safe_close(manager->fd_inotify);
 
+        manager->monitor = sd_device_monitor_unref(manager->monitor);
+
         /* discard queued events and kill workers */
         event_queue_cleanup(manager, EVENT_QUEUED);
         manager_kill_workers(manager);
-
-        assert_se(sd_event_now(manager->event, CLOCK_MONOTONIC, &usec) >= 0);
-
-        r = sd_event_add_time(manager->event, NULL, CLOCK_MONOTONIC,
-                              usec + 30 * USEC_PER_SEC, USEC_PER_SEC, on_exit_timeout, manager);
-        if (r < 0)
-                return;
 }
 
 /* reload requested, HUP signal received, rules changed, builtin changed */
@@ -934,16 +915,18 @@ static int on_worker(sd_event_source *s, int fd, uint32_t revents, void *userdat
                 struct ucred *ucred = NULL;
                 struct worker *worker;
 
-                size = recvmsg(fd, &msghdr, MSG_DONTWAIT);
-                if (size < 0) {
-                        if (errno == EINTR)
-                                continue;
-                        else if (errno == EAGAIN)
-                                /* nothing more to read */
-                                break;
+                size = recvmsg_safe(fd, &msghdr, MSG_DONTWAIT);
+                if (size == -EINTR)
+                        continue;
+                if (size == -EAGAIN)
+                        /* nothing more to read */
+                        break;
+                if (size < 0)
+                        return log_error_errno(size, "Failed to receive message: %m");
 
-                        return log_error_errno(errno, "Failed to receive message: %m");
-                } else if (size != sizeof(struct worker_message)) {
+                cmsg_close_all(&msghdr);
+
+                if (size != sizeof(struct worker_message)) {
                         log_warning("Ignoring worker message with invalid size %zi bytes", size);
                         continue;
                 }
@@ -1335,10 +1318,12 @@ static int on_sigchld(sd_event_source *s, const struct signalfd_siginfo *si, voi
                         device_delete_db(worker->event->dev);
                         device_tag_index(worker->event->dev, NULL, false);
 
-                        /* forward kernel event without amending it */
-                        r = device_monitor_send_device(manager->monitor, NULL, worker->event->dev_kernel);
-                        if (r < 0)
-                                log_device_error_errno(worker->event->dev_kernel, r, "Failed to send back device to kernel: %m");
+                        if (manager->monitor) {
+                                /* forward kernel event without amending it */
+                                r = device_monitor_send_device(manager->monitor, NULL, worker->event->dev_kernel);
+                                if (r < 0)
+                                        log_device_error_errno(worker->event->dev_kernel, r, "Failed to send back device to kernel: %m");
+                        }
                 }
 
                 worker_free(worker);
@@ -1599,7 +1584,11 @@ static int manager_new(Manager **ret, int fd_ctrl, int fd_uevent, const char *cg
         if (r < 0)
                 return log_error_errno(r, "Failed to initialize device monitor: %m");
 
-        (void) sd_device_monitor_set_receive_buffer_size(manager->monitor, 128 * 1024 * 1024);
+        /* Bump receiver buffer, but only if we are not called via socket activation, as in that
+         * case systemd sets the receive buffer size for us, and the value in the .socket unit
+         * should take full effect. */
+        if (fd_uevent < 0)
+                (void) sd_device_monitor_set_receive_buffer_size(manager->monitor, 128 * 1024 * 1024);
 
         r = device_monitor_enable_receiving(manager->monitor);
         if (r < 0)

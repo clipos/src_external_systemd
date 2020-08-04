@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
-#include <sched.h>
 #include <sys/utsname.h>
 
 #include "analyze-security.h"
@@ -12,7 +11,8 @@
 #include "in-addr-util.h"
 #include "locale-util.h"
 #include "macro.h"
-#include "missing.h"
+#include "missing_capability.h"
+#include "missing_sched.h"
 #include "nulstr-util.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -64,6 +64,8 @@ struct security_info {
         bool protect_control_groups;
         bool protect_kernel_modules;
         bool protect_kernel_tunables;
+        bool protect_kernel_logs;
+        bool protect_clock;
 
         char *protect_home;
         char *protect_system;
@@ -305,7 +307,7 @@ static int assess_root_directory(
         assert(ret_description);
 
         *ret_badness =
-                empty_or_root(info->root_directory) ||
+                empty_or_root(info->root_directory) &&
                 empty_or_root(info->root_image);
         *ret_description = NULL;
 
@@ -745,7 +747,7 @@ static const struct security_assessor security_assessor_table[] = {
         {
                 .id = "ProtectControlGroups=",
                 .description_good = "Service cannot modify the control group file system",
-                .description_bad = "Service may modify to the control group file system",
+                .description_bad = "Service may modify the control group file system",
                 .url = "https://www.freedesktop.org/software/systemd/man/systemd.exec.html#ProtectControlGroups=",
                 .weight = 1000,
                 .range = 1,
@@ -771,6 +773,26 @@ static const struct security_assessor security_assessor_table[] = {
                 .range = 1,
                 .assess = assess_bool,
                 .offset = offsetof(struct security_info, protect_kernel_tunables),
+        },
+        {
+                .id = "ProtectKernelLogs=",
+                .description_good = "Service cannot read from or write to the kernel log ring buffer",
+                .description_bad = "Service may read from or write to the kernel log ring buffer",
+                .url = "https://www.freedesktop.org/software/systemd/man/systemd.exec.html#ProtectKernelLogs=",
+                .weight = 1000,
+                .range = 1,
+                .assess = assess_bool,
+                .offset = offsetof(struct security_info, protect_kernel_logs),
+        },
+        {
+                .id = "ProtectClock=",
+                .description_good = "Service cannot write to the hardware clock or system clock",
+                .description_bad = "Service may write to the hardware clock or system clock",
+                .url = "https://www.freedesktop.org/software/systemd/man/systemd.exec.html#ProtectClock=",
+                .weight = 1000,
+                .range = 1,
+                .assess = assess_bool,
+                .offset = offsetof(struct security_info, protect_clock),
         },
         {
                 .id = "ProtectHome=",
@@ -891,7 +913,7 @@ static const struct security_assessor security_assessor_table[] = {
                 .parameter = (UINT64_C(1) << CAP_NET_ADMIN),
         },
         {
-                .id = "CapabilityBoundingSet=~CAP_RAWIO",
+                .id = "CapabilityBoundingSet=~CAP_SYS_RAWIO",
                 .description_good = "Service has no raw I/O access",
                 .description_bad = "Service has raw I/O access",
                 .url = "https://www.freedesktop.org/software/systemd/man/systemd.exec.html#CapabilityBoundingSet=",
@@ -1436,11 +1458,11 @@ static int assess(const struct security_info *info, Table *overview_table, Analy
                 if (!details_table)
                         return log_oom();
 
-                (void) table_set_sort(details_table, 3, 1, (size_t) -1);
+                (void) table_set_sort(details_table, (size_t) 3, (size_t) 1, (size_t) -1);
                 (void) table_set_reverse(details_table, 3, true);
 
                 if (getenv_bool("SYSTEMD_ANALYZE_DEBUG") <= 0)
-                        (void) table_set_display(details_table, 0, 1, 2, 6, (size_t) -1);
+                        (void) table_set_display(details_table, (size_t) 0, (size_t) 1, (size_t) 2, (size_t) 6, (size_t) -1);
         }
 
         for (i = 0; i < ELEMENTSOF(security_assessor_table); i++) {
@@ -1473,7 +1495,6 @@ static int assess(const struct security_info *info, Table *overview_table, Analy
 
                 if (details_table) {
                         const char *checkmark, *description, *color = NULL;
-                        TableCell *cell;
 
                         if (badness == UINT64_MAX) {
                                 checkmark = " ";
@@ -1496,13 +1517,12 @@ static int assess(const struct security_info *info, Table *overview_table, Analy
                         if (d)
                                 description = d;
 
-                        r = table_add_cell_full(details_table, &cell, TABLE_STRING, checkmark, 1, 1, 0, 0, 0);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to add cell to table: %m");
-                        if (color)
-                                (void) table_set_color(details_table, cell, color);
-
                         r = table_add_many(details_table,
+                                           TABLE_STRING, checkmark,
+                                           TABLE_SET_MINIMUM_WIDTH, 1,
+                                           TABLE_SET_MAXIMUM_WIDTH, 1,
+                                           TABLE_SET_ELLIPSIZE_PERCENT, 0,
+                                           TABLE_SET_COLOR, color,
                                            TABLE_STRING, a->id, TABLE_SET_URL, a->url,
                                            TABLE_STRING, description,
                                            TABLE_UINT64, a->weight, TABLE_SET_ALIGN_PERCENT, 100,
@@ -1510,7 +1530,7 @@ static int assess(const struct security_info *info, Table *overview_table, Analy
                                            TABLE_UINT64, a->range, TABLE_SET_ALIGN_PERCENT, 100,
                                            TABLE_EMPTY, TABLE_SET_ALIGN_PERCENT, 100);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to add cells to table: %m");
+                                return table_log_add_error(r);
                 }
         }
 
@@ -1586,35 +1606,26 @@ static int assess(const struct security_info *info, Table *overview_table, Analy
 
         if (overview_table) {
                 char buf[DECIMAL_STR_MAX(uint64_t) + 1 + DECIMAL_STR_MAX(uint64_t) + 1];
-                TableCell *cell;
+                _cleanup_free_ char *url = NULL;
 
-                r = table_add_cell(overview_table, &cell, TABLE_STRING, info->id);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to add cell to table: %m");
                 if (info->fragment_path) {
-                        _cleanup_free_ char *url = NULL;
-
                         r = file_url_from_path(info->fragment_path, &url);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to generate URL from path: %m");
-
-                        (void) table_set_url(overview_table, cell, url);
                 }
 
                 xsprintf(buf, "%" PRIu64 ".%" PRIu64, exposure / 10, exposure % 10);
-                r = table_add_cell(overview_table, &cell, TABLE_STRING, buf);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to add cell to table: %m");
-                (void) table_set_align_percent(overview_table, cell, 100);
 
-                r = table_add_cell(overview_table, &cell, TABLE_STRING, badness_table[i].name);
+                r = table_add_many(overview_table,
+                                   TABLE_STRING, info->id,
+                                   TABLE_SET_URL, url,
+                                   TABLE_STRING, buf,
+                                   TABLE_SET_ALIGN_PERCENT, 100,
+                                   TABLE_STRING, badness_table[i].name,
+                                   TABLE_SET_COLOR, strempty(badness_table[i].color),
+                                   TABLE_STRING, special_glyph(badness_table[i].smiley));
                 if (r < 0)
-                        return log_error_errno(r, "Failed to add cell to table: %m");
-                (void) table_set_color(overview_table, cell, strempty(badness_table[i].color));
-
-                r = table_add_cell(overview_table, NULL, TABLE_STRING, special_glyph(badness_table[i].smiley));
-                if (r < 0)
-                        return log_error_errno(r, "Failed to add cell to table: %m");
+                        return table_log_add_error(r);
         }
 
         return 0;
@@ -1906,6 +1917,8 @@ static int acquire_security_info(sd_bus *bus, const char *name, struct security_
                 { "ProtectHostname",         "b",       NULL,                                    offsetof(struct security_info, protect_hostname)          },
                 { "ProtectKernelModules",    "b",       NULL,                                    offsetof(struct security_info, protect_kernel_modules)    },
                 { "ProtectKernelTunables",   "b",       NULL,                                    offsetof(struct security_info, protect_kernel_tunables)   },
+                { "ProtectKernelLogs",       "b",       NULL,                                    offsetof(struct security_info, protect_kernel_logs)       },
+                { "ProtectClock",            "b",       NULL,                                    offsetof(struct security_info, protect_clock)             },
                 { "ProtectSystem",           "s",       NULL,                                    offsetof(struct security_info, protect_system)            },
                 { "RemoveIPC",               "b",       NULL,                                    offsetof(struct security_info, remove_ipc)                },
                 { "RestrictAddressFamilies", "(bas)",   property_read_restrict_address_families, 0                                                         },
@@ -1979,6 +1992,13 @@ static int acquire_security_info(sd_bus *bus, const char *name, struct security_
 
         if (info->protect_kernel_modules)
                 info->capability_bounding_set &= ~(UINT64_C(1) << CAP_SYS_MODULE);
+
+        if (info->protect_kernel_logs)
+                info->capability_bounding_set &= ~(UINT64_C(1) << CAP_SYSLOG);
+
+        if (info->protect_clock)
+                info->capability_bounding_set &= ~((UINT64_C(1) << CAP_SYS_TIME) |
+                                                   (UINT64_C(1) << CAP_WAKE_ALARM));
 
         if (info->private_devices)
                 info->capability_bounding_set &= ~((UINT64_C(1) << CAP_MKNOD) |
@@ -2093,7 +2113,7 @@ int analyze_security(sd_bus *bus, char **units, AnalyzeSecurityFlags flags) {
                                 fflush(stdout);
                         }
 
-                        r = unit_name_mangle_with_suffix(*i, 0, ".service", &mangled);
+                        r = unit_name_mangle(*i, 0, &mangled);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to mangle unit name '%s': %m", *i);
 

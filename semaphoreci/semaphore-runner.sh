@@ -5,7 +5,7 @@ set -eux
 # default to Debian testing
 DISTRO=${DISTRO:-debian}
 RELEASE=${RELEASE:-buster}
-BRANCH=${BRANCH:-master}
+BRANCH=${BRANCH:-debian/master}
 ARCH=${ARCH:-amd64}
 CONTAINER=${RELEASE}-${ARCH}
 CACHE_DIR=${SEMAPHORE_CACHE_DIR:=/tmp}
@@ -18,7 +18,7 @@ create_container() {
     # create autopkgtest LXC image; this sometimes fails with "Unable to fetch
     # GPG key from keyserver", so retry a few times
     for retry in $(seq 5); do
-        sudo lxc-create -n $CONTAINER -t download -- -d $DISTRO -r $RELEASE -a $ARCH && break
+        sudo lxc-create -n $CONTAINER -t download -- -d $DISTRO -r $RELEASE -a $ARCH --keyserver hkp://keyserver.ubuntu.com:80 && break
         sleep $((retry*retry))
     done
 
@@ -35,7 +35,11 @@ while [ -z "\$(ip route list 0/0)" ]; do sleep 1; done
 apt-get -q --allow-releaseinfo-change update
 apt-get -y dist-upgrade
 apt-get install -y eatmydata
+# The following four are needed as long as these deps are not covered by Debian's own packaging
+apt-get install -y libfdisk-dev libp11-kit-dev libssl-dev libpwquality-dev
 apt-get purge --auto-remove -y unattended-upgrades
+systemctl unmask systemd-networkd
+systemctl enable systemd-networkd
 EOF
     sudo lxc-stop -n $CONTAINER
 }

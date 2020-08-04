@@ -6,14 +6,11 @@
 #include <linux/ip.h>
 
 #include "conf-parser.h"
+#include "fou-tunnel.h"
 #include "ip-protocol-list.h"
-#include "missing.h"
-#include "netdev/fou-tunnel.h"
 #include "netlink-util.h"
-#include "networkd-link.h"
 #include "networkd-manager.h"
 #include "parse-util.h"
-#include "sd-netlink.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "util.h"
@@ -152,7 +149,10 @@ int config_parse_ip_protocol(
                 void *data,
                 void *userdata) {
 
-        uint8_t *protocol = data;
+        uint8_t *ret = data;
+        unsigned protocol;
+        /* linux/fou.h defines the netlink field as one byte, so we need to reject protocols numbers that
+         * don't fit in one byte. */
         int r;
 
         assert(filename);
@@ -161,19 +161,26 @@ int config_parse_ip_protocol(
         assert(rvalue);
         assert(data);
 
-        assert_cc(IPPROTO_MAX-1 <= UINT8_MAX);
-
         r = parse_ip_protocol(rvalue);
-        if (r < 0) {
-                r = safe_atou8(rvalue, protocol);
+        if (r >= 0)
+                protocol = r;
+        else {
+                r = safe_atou(rvalue, &protocol);
                 if (r < 0)
                         log_syntax(unit, LOG_ERR, filename, line, r,
-                                   "Failed to parse IP protocol '%s' for Foo over UDP tunnel, "
+                                   "Failed to parse IP protocol '%s' for FooOverUDP tunnel, "
                                    "ignoring assignment: %m", rvalue);
                 return 0;
         }
 
-        *protocol = r;
+        if (protocol > UINT8_MAX) {
+                log_syntax(unit, LOG_ERR, filename, line, 0,
+                           "IP protocol '%s' for FooOverUDP tunnel out of range, "
+                           "ignoring assignment: %m", rvalue);
+                return 0;
+        }
+
+        *ret = protocol;
         return 0;
 }
 
@@ -206,7 +213,7 @@ int config_parse_fou_tunnel_address(
         r = in_addr_from_string_auto(rvalue, f, addr);
         if (r < 0)
                 log_syntax(unit, LOG_ERR, filename, line, r,
-                           "Foo over UDP tunnel '%s' address is invalid, ignoring assignment: %s",
+                           "FooOverUDP tunnel '%s' address is invalid, ignoring assignment: %s",
                            lvalue, rvalue);
 
         return 0;
@@ -265,7 +272,7 @@ static void fou_tunnel_init(NetDev *netdev) {
 const NetDevVTable foutnl_vtable = {
         .object_size = sizeof(FouTunnel),
         .init = fou_tunnel_init,
-        .sections = "Match\0NetDev\0FooOverUDP\0",
+        .sections = NETDEV_COMMON_SECTIONS "FooOverUDP\0",
         .create = netdev_fou_tunnel_create,
         .create_type = NETDEV_CREATE_INDEPENDENT,
         .config_verify = netdev_fou_tunnel_verify,

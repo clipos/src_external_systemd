@@ -3,6 +3,7 @@
 #include "sd-messages.h"
 
 #include "alloc-util.h"
+#include "resolved-bus.h"
 #include "resolved-dns-server.h"
 #include "resolved-dns-stub.h"
 #include "resolved-resolv-conf.h"
@@ -24,8 +25,10 @@ int dns_server_new(
                 Link *l,
                 int family,
                 const union in_addr_union *in_addr,
-                int ifindex) {
+                int ifindex,
+                const char *server_name) {
 
+        _cleanup_free_ char *name = NULL;
         DnsServer *s;
 
         assert(m);
@@ -43,6 +46,12 @@ int dns_server_new(
                         return -E2BIG;
         }
 
+        if (server_name) {
+                name = strdup(server_name);
+                if (!name)
+                        return -ENOMEM;
+        }
+
         s = new(DnsServer, 1);
         if (!s)
                 return -ENOMEM;
@@ -54,6 +63,7 @@ int dns_server_new(
                 .family = family,
                 .address = *in_addr,
                 .ifindex = ifindex,
+                .server_name = TAKE_PTR(name),
         };
 
         dns_server_reset_features(s);
@@ -106,6 +116,7 @@ static DnsServer* dns_server_free(DnsServer *s)  {
 #endif
 
         free(s->server_string);
+        free(s->server_name);
         return mfree(s);
 }
 
@@ -410,6 +421,7 @@ DnsServerFeatureLevel dns_server_possible_feature_level(DnsServer *s) {
                 s->possible_feature_level = s->verified_feature_level;
         else {
                 DnsServerFeatureLevel p = s->possible_feature_level;
+                int log_level = LOG_WARNING;
 
                 if (s->n_failed_tcp >= DNS_SERVER_FEATURE_RETRY_ATTEMPTS &&
                     s->possible_feature_level == DNS_SERVER_FEATURE_LEVEL_TCP) {
@@ -436,6 +448,10 @@ DnsServerFeatureLevel dns_server_possible_feature_level(DnsServer *s) {
 
                         log_debug("Server doesn't support EDNS(0) properly, downgrading feature level...");
                         s->possible_feature_level = DNS_SERVER_FEATURE_LEVEL_UDP;
+
+                        /* Users often don't control the DNS server they use so let's not complain too loudly
+                         * when we can't use EDNS because the DNS server doesn't support it. */
+                        log_level = LOG_NOTICE;
 
                 } else if (s->packet_rrsig_missing &&
                            s->possible_feature_level >= DNS_SERVER_FEATURE_LEVEL_DO) {
@@ -481,9 +497,9 @@ DnsServerFeatureLevel dns_server_possible_feature_level(DnsServer *s) {
                         /* We changed the feature level, reset the counting */
                         dns_server_reset_counters(s);
 
-                        log_warning("Using degraded feature set (%s) for DNS server %s.",
-                                    dns_server_feature_level_to_string(s->possible_feature_level),
-                                    dns_server_string(s));
+                        log_full(log_level, "Using degraded feature set %s instead of %s for DNS server %s.",
+                                 dns_server_feature_level_to_string(s->possible_feature_level),
+                                 dns_server_feature_level_to_string(p), dns_server_string(s));
                 }
         }
 
@@ -680,6 +696,8 @@ DnsServer *manager_set_dns_server(Manager *m, DnsServer *s) {
 
         if (m->unicast_scope)
                 dns_cache_flush(&m->unicast_scope->cache);
+
+        (void) manager_send_changed(m, "CurrentDNSServer");
 
         return s;
 }

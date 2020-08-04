@@ -11,7 +11,7 @@
 
 #include "alloc-util.h"
 #include "fd-util.h"
-#include "netdev/tuntap.h"
+#include "tuntap.h"
 #include "user-util.h"
 
 #define TUN_DEV "/dev/net/tun"
@@ -147,7 +147,7 @@ static int tuntap_verify(NetDev *netdev, const char *filename) {
 
 const NetDevVTable tun_vtable = {
         .object_size = sizeof(TunTap),
-        .sections = "Match\0NetDev\0Tun\0",
+        .sections = NETDEV_COMMON_SECTIONS "Tun\0",
         .config_verify = tuntap_verify,
         .done = tuntap_done,
         .create = netdev_create_tuntap,
@@ -156,7 +156,7 @@ const NetDevVTable tun_vtable = {
 
 const NetDevVTable tap_vtable = {
         .object_size = sizeof(TunTap),
-        .sections = "Match\0NetDev\0Tap\0",
+        .sections = NETDEV_COMMON_SECTIONS "Tap\0",
         .config_verify = tuntap_verify,
         .done = tuntap_done,
         .create = netdev_create_tuntap,

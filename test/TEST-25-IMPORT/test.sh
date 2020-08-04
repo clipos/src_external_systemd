@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 TEST_DESCRIPTION="test importd"
 
@@ -22,9 +22,6 @@ Description=Testsuite service
 [Service]
 ExecStart=/testsuite.sh
 Type=oneshot
-StandardOutput=tty
-StandardError=tty
-NotifyAccess=all
 EOF
         cp testsuite.sh $initdir/
 

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
+#include <linux/nl80211.h>
 #include <stdbool.h>
 
 #include "sd-device.h"
@@ -14,15 +15,27 @@
 #define LINK_BRIDGE_PORT_PRIORITY_INVALID 128
 #define LINK_BRIDGE_PORT_PRIORITY_MAX 63
 
+char *link_get_type_string(unsigned short iftype, sd_device *device);
 bool net_match_config(Set *match_mac,
-                      char * const *match_path,
-                      char * const *match_driver,
-                      char * const *match_type,
-                      char * const *match_name,
+                      Set *match_permanent_mac,
+                      char * const *match_paths,
+                      char * const *match_drivers,
+                      char * const *match_iftypes,
+                      char * const *match_names,
                       char * const *match_property,
+                      char * const *match_wifi_iftype,
+                      char * const *match_ssid,
+                      Set *match_bssid,
                       sd_device *device,
                       const struct ether_addr *dev_mac,
-                      const char *dev_name);
+                      const struct ether_addr *dev_permanent_mac,
+                      const char *dev_driver,
+                      unsigned short dev_iftype,
+                      const char *dev_name,
+                      char * const *alternative_names,
+                      enum nl80211_iftype dev_wifi_iftype,
+                      const char *dev_ssid,
+                      const struct ether_addr *dev_bssid);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_net_condition);
 CONFIG_PARSER_PROTOTYPE(config_parse_hwaddr);

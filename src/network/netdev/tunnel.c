@@ -6,16 +6,13 @@
 #include <linux/if_tunnel.h>
 #include <linux/ip6_tunnel.h>
 
-#include "sd-netlink.h"
-
 #include "conf-parser.h"
-#include "missing.h"
+#include "missing_network.h"
 #include "netlink-util.h"
-#include "networkd-link.h"
-#include "netdev/tunnel.h"
 #include "parse-util.h"
 #include "string-table.h"
 #include "string-util.h"
+#include "tunnel.h"
 #include "util.h"
 
 #define DEFAULT_TNL_HOP_LIMIT   64
@@ -226,6 +223,10 @@ static int netdev_gre_erspan_fill_message_create(NetDev *netdev, Link *link, sd_
 }
 
 static int netdev_ip6gre_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *m) {
+        uint32_t ikey = 0;
+        uint32_t okey = 0;
+        uint16_t iflags = 0;
+        uint16_t oflags = 0;
         Tunnel *t;
         int r;
 
@@ -266,6 +267,38 @@ static int netdev_ip6gre_fill_message_create(NetDev *netdev, Link *link, sd_netl
         r = sd_netlink_message_append_u32(m, IFLA_GRE_FLAGS, t->flags);
         if (r < 0)
                 return log_netdev_error_errno(netdev, r, "Could not append IFLA_GRE_FLAGS attribute: %m");
+
+        if (t->key != 0) {
+                ikey = okey = htobe32(t->key);
+                iflags |= GRE_KEY;
+                oflags |= GRE_KEY;
+        }
+
+        if (t->ikey != 0) {
+                ikey = htobe32(t->ikey);
+                iflags |= GRE_KEY;
+        }
+
+        if (t->okey != 0) {
+                okey = htobe32(t->okey);
+                oflags |= GRE_KEY;
+        }
+
+        r = sd_netlink_message_append_u32(m, IFLA_GRE_IKEY, ikey);
+        if (r < 0)
+                return log_netdev_error_errno(netdev, r, "Could not append IFLA_GRE_IKEY attribute: %m");
+
+        r = sd_netlink_message_append_u32(m, IFLA_GRE_OKEY, okey);
+        if (r < 0)
+                return log_netdev_error_errno(netdev, r, "Could not append IFLA_GRE_OKEY attribute: %m");
+
+        r = sd_netlink_message_append_u16(m, IFLA_GRE_IFLAGS, iflags);
+        if (r < 0)
+                return log_netdev_error_errno(netdev, r, "Could not append IFLA_GRE_IFLAGS attribute: %m");
+
+        r = sd_netlink_message_append_u16(m, IFLA_GRE_OFLAGS, oflags);
+        if (r < 0)
+                return log_netdev_error_errno(netdev, r, "Could not append IFLA_GRE_OFLAGS, attribute: %m");
 
         return r;
 }
@@ -696,7 +729,7 @@ static void ipip_sit_init(NetDev *n) {
         assert(t);
 
         t->pmtudisc = true;
-        t->fou_encap_type = FOU_ENCAP_DIRECT;
+        t->fou_encap_type = NETDEV_FOO_OVER_UDP_ENCAP_DIRECT;
         t->isatap = -1;
 }
 
@@ -738,7 +771,7 @@ static void gre_erspan_init(NetDev *n) {
 
         t->pmtudisc = true;
         t->gre_erspan_sequence = -1;
-        t->fou_encap_type = FOU_ENCAP_DIRECT;
+        t->fou_encap_type = NETDEV_FOO_OVER_UDP_ENCAP_DIRECT;
 }
 
 static void ip6gre_init(NetDev *n) {
@@ -772,7 +805,7 @@ static void ip6tnl_init(NetDev *n) {
 const NetDevVTable ipip_vtable = {
         .object_size = sizeof(Tunnel),
         .init = ipip_sit_init,
-        .sections = "Match\0NetDev\0Tunnel\0",
+        .sections = NETDEV_COMMON_SECTIONS "Tunnel\0",
         .fill_message_create = netdev_ipip_sit_fill_message_create,
         .create_type = NETDEV_CREATE_STACKED,
         .config_verify = netdev_tunnel_verify,
@@ -782,7 +815,7 @@ const NetDevVTable ipip_vtable = {
 const NetDevVTable sit_vtable = {
         .object_size = sizeof(Tunnel),
         .init = ipip_sit_init,
-        .sections = "Match\0NetDev\0Tunnel\0",
+        .sections = NETDEV_COMMON_SECTIONS "Tunnel\0",
         .fill_message_create = netdev_ipip_sit_fill_message_create,
         .create_type = NETDEV_CREATE_STACKED,
         .config_verify = netdev_tunnel_verify,
@@ -792,7 +825,7 @@ const NetDevVTable sit_vtable = {
 const NetDevVTable vti_vtable = {
         .object_size = sizeof(Tunnel),
         .init = vti_init,
-        .sections = "Match\0NetDev\0Tunnel\0",
+        .sections = NETDEV_COMMON_SECTIONS "Tunnel\0",
         .fill_message_create = netdev_vti_fill_message_create,
         .create_type = NETDEV_CREATE_STACKED,
         .config_verify = netdev_tunnel_verify,
@@ -802,7 +835,7 @@ const NetDevVTable vti_vtable = {
 const NetDevVTable vti6_vtable = {
         .object_size = sizeof(Tunnel),
         .init = vti_init,
-        .sections = "Match\0NetDev\0Tunnel\0",
+        .sections = NETDEV_COMMON_SECTIONS "Tunnel\0",
         .fill_message_create = netdev_vti_fill_message_create,
         .create_type = NETDEV_CREATE_STACKED,
         .config_verify = netdev_tunnel_verify,
@@ -812,7 +845,7 @@ const NetDevVTable vti6_vtable = {
 const NetDevVTable gre_vtable = {
         .object_size = sizeof(Tunnel),
         .init = gre_erspan_init,
-        .sections = "Match\0NetDev\0Tunnel\0",
+        .sections = NETDEV_COMMON_SECTIONS "Tunnel\0",
         .fill_message_create = netdev_gre_erspan_fill_message_create,
         .create_type = NETDEV_CREATE_STACKED,
         .config_verify = netdev_tunnel_verify,
@@ -822,7 +855,7 @@ const NetDevVTable gre_vtable = {
 const NetDevVTable gretap_vtable = {
         .object_size = sizeof(Tunnel),
         .init = gre_erspan_init,
-        .sections = "Match\0NetDev\0Tunnel\0",
+        .sections = NETDEV_COMMON_SECTIONS "Tunnel\0",
         .fill_message_create = netdev_gre_erspan_fill_message_create,
         .create_type = NETDEV_CREATE_STACKED,
         .config_verify = netdev_tunnel_verify,
@@ -832,7 +865,7 @@ const NetDevVTable gretap_vtable = {
 const NetDevVTable ip6gre_vtable = {
         .object_size = sizeof(Tunnel),
         .init = ip6gre_init,
-        .sections = "Match\0NetDev\0Tunnel\0",
+        .sections = NETDEV_COMMON_SECTIONS "Tunnel\0",
         .fill_message_create = netdev_ip6gre_fill_message_create,
         .create_type = NETDEV_CREATE_STACKED,
         .config_verify = netdev_tunnel_verify,
@@ -842,7 +875,7 @@ const NetDevVTable ip6gre_vtable = {
 const NetDevVTable ip6gretap_vtable = {
         .object_size = sizeof(Tunnel),
         .init = ip6gre_init,
-        .sections = "Match\0NetDev\0Tunnel\0",
+        .sections = NETDEV_COMMON_SECTIONS "Tunnel\0",
         .fill_message_create = netdev_ip6gre_fill_message_create,
         .create_type = NETDEV_CREATE_STACKED,
         .config_verify = netdev_tunnel_verify,
@@ -852,7 +885,7 @@ const NetDevVTable ip6gretap_vtable = {
 const NetDevVTable ip6tnl_vtable = {
         .object_size = sizeof(Tunnel),
         .init = ip6tnl_init,
-        .sections = "Match\0NetDev\0Tunnel\0",
+        .sections = NETDEV_COMMON_SECTIONS "Tunnel\0",
         .fill_message_create = netdev_ip6tnl_fill_message_create,
         .create_type = NETDEV_CREATE_STACKED,
         .config_verify = netdev_tunnel_verify,
@@ -862,7 +895,7 @@ const NetDevVTable ip6tnl_vtable = {
 const NetDevVTable erspan_vtable = {
         .object_size = sizeof(Tunnel),
         .init = gre_erspan_init,
-        .sections = "Match\0NetDev\0Tunnel\0",
+        .sections = NETDEV_COMMON_SECTIONS "Tunnel\0",
         .fill_message_create = netdev_gre_erspan_fill_message_create,
         .create_type = NETDEV_CREATE_STACKED,
         .config_verify = netdev_tunnel_verify,

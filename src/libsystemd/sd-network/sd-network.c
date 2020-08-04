@@ -2,7 +2,6 @@
 
 #include <errno.h>
 #include <poll.h>
-#include <string.h>
 #include <sys/inotify.h>
 
 #include "sd-network.h"
@@ -229,6 +228,10 @@ _public_ int sd_network_link_get_timezone(int ifindex, char **ret) {
         return network_link_get_string(ifindex, "TIMEZONE", ret);
 }
 
+_public_ int sd_network_link_get_dhcp4_address(int ifindex, char **ret) {
+        return network_link_get_string(ifindex, "DHCP4_ADDRESS", ret);
+}
+
 _public_ int sd_network_link_get_dns(int ifindex, char ***ret) {
         return network_link_get_strv(ifindex, "DNS", ret);
 }
@@ -243,6 +246,10 @@ _public_ int sd_network_link_get_search_domains(int ifindex, char ***ret) {
 
 _public_ int sd_network_link_get_route_domains(int ifindex, char ***ret) {
         return network_link_get_strv(ifindex, "ROUTE_DOMAINS", ret);
+}
+
+_public_ int sd_network_link_get_sip_servers(int ifindex, char ***ret) {
+        return network_link_get_strv(ifindex, "SIP", ret);
 }
 
 _public_ int sd_network_link_get_dns_default_route(int ifindex) {
@@ -269,7 +276,6 @@ static int network_link_get_ifindexes(int ifindex, const char *key, int **ret) {
         _cleanup_free_ int *ifis = NULL;
         _cleanup_free_ char *s = NULL;
         size_t allocated = 0, c = 0;
-        const char *x;
         int r;
 
         assert_return(ifindex > 0, -EINVAL);
@@ -282,7 +288,7 @@ static int network_link_get_ifindexes(int ifindex, const char *key, int **ret) {
         if (r < 0)
                 return r;
 
-        for (x = s;;) {
+        for (const char *x = s;;) {
                 _cleanup_free_ char *word = NULL;
 
                 r = extract_first_word(&x, &word, NULL, 0);
@@ -291,14 +297,12 @@ static int network_link_get_ifindexes(int ifindex, const char *key, int **ret) {
                 if (r == 0)
                         break;
 
-                r = parse_ifindex(word, &ifindex);
-                if (r < 0)
-                        return r;
-
                 if (!GREEDY_REALLOC(ifis, allocated, c + 2))
                         return -ENOMEM;
 
-                ifis[c++] = ifindex;
+                r = ifis[c++] = parse_ifindex(word);
+                if (r < 0)
+                        return r;
         }
 
         if (ifis)

@@ -1,11 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
+#include <linux/loop.h>
 #include <sched.h>
 #include <stdio.h>
-#include <string.h>
 #include <sys/mount.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #include <linux/fs.h>
 
@@ -13,11 +12,11 @@
 #include "base-filesystem.h"
 #include "dev-setup.h"
 #include "fd-util.h"
+#include "format-util.h"
 #include "fs-util.h"
 #include "label.h"
 #include "loop-util.h"
 #include "loopback-setup.h"
-#include "missing.h"
 #include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
@@ -32,6 +31,7 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
+#include "tmpfile-util.h"
 #include "umask-util.h"
 #include "user-util.h"
 
@@ -110,6 +110,12 @@ static const MountEntry protect_kernel_modules_table[] = {
         { "/lib/modules",        INACCESSIBLE, true  },
 #endif
         { "/usr/lib/modules",    INACCESSIBLE, true  },
+};
+
+/* ProtectKernelLogs= option */
+static const MountEntry protect_kernel_logs_table[] = {
+        { "/proc/kmsg",          INACCESSIBLE, true },
+        { "/dev/kmsg",           INACCESSIBLE, true },
 };
 
 /*
@@ -623,10 +629,9 @@ static int clone_device_node(
         }
 
         /* We're about to fallback to bind-mounting the device
-         * node. So create a dummy bind-mount target. */
-        mac_selinux_create_file_prepare(d, 0);
+         * node. So create a dummy bind-mount target.
+         * Do not prepare device-node SELinux label (see issue 13762) */
         r = mknod(dn, S_IFREG, 0);
-        mac_selinux_create_file_clear();
         if (r < 0 && errno != EEXIST)
                 return log_debug_errno(errno, "mknod() fallback failed for '%s': %m", d);
 
@@ -744,7 +749,7 @@ static int mount_private_dev(MountEntry *m) {
 
         r = dev_setup(temporary_mount, UID_INVALID, GID_INVALID);
         if (r < 0)
-                log_debug_errno(r, "Failed to setup basic device tree at '%s', ignoring: %m", temporary_mount);
+                log_debug_errno(r, "Failed to set up basic device tree at '%s', ignoring: %m", temporary_mount);
 
         /* Create the /dev directory if missing. It is more likely to be
          * missing when the service is started with RootDirectory. This is
@@ -875,7 +880,7 @@ static int follow_symlink(
          * a time by specifying CHASE_STEP. This function returns 0 if we resolved one step, and > 0 if we reached the
          * end and already have a fully normalized name. */
 
-        r = chase_symlinks(mount_entry_path(m), root_directory, CHASE_STEP|CHASE_NONEXISTENT, &target);
+        r = chase_symlinks(mount_entry_path(m), root_directory, CHASE_STEP|CHASE_NONEXISTENT, &target, NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to chase symlinks '%s': %m", mount_entry_path(m));
         if (r > 0) /* Reached the end, nothing more to resolve */
@@ -900,6 +905,7 @@ static int apply_mount(
                 const char *root_directory,
                 MountEntry *m) {
 
+        _cleanup_free_ char *inaccessible = NULL;
         bool rbind = true, make = false;
         const char *what;
         int r;
@@ -911,6 +917,8 @@ static int apply_mount(
         switch (m->mode) {
 
         case INACCESSIBLE: {
+                _cleanup_free_ char *tmp = NULL;
+                const char *runtime_dir;
                 struct stat target;
 
                 /* First, get rid of everything that is below if there
@@ -925,10 +933,20 @@ static int apply_mount(
                         return log_debug_errno(errno, "Failed to lstat() %s to determine what to mount over it: %m", mount_entry_path(m));
                 }
 
-                what = mode_to_inaccessible_node(target.st_mode);
-                if (!what)
+                if (geteuid() == 0)
+                        runtime_dir = "/run/systemd";
+                else {
+                        if (asprintf(&tmp, "/run/user/"UID_FMT, geteuid()) < 0)
+                                log_oom();
+
+                        runtime_dir = tmp;
+                }
+
+                r = mode_to_inaccessible_node(runtime_dir, target.st_mode, &inaccessible);
+                if (r < 0)
                         return log_debug_errno(SYNTHETIC_ERRNO(ELOOP),
                                                "File type not supported for inaccessible mounts. Note that symlinks are not allowed");
+                what = inaccessible;
                 break;
         }
 
@@ -957,7 +975,7 @@ static int apply_mount(
                  * mount source paths are always relative to the host root, hence we pass NULL as root directory to
                  * chase_symlinks() here. */
 
-                r = chase_symlinks(mount_entry_source(m), NULL, CHASE_TRAIL_SLASH, &chased);
+                r = chase_symlinks(mount_entry_source(m), NULL, CHASE_TRAIL_SLASH, &chased, NULL);
                 if (r == -ENOENT && m->ignore) {
                         log_debug_errno(r, "Path %s does not exist, ignoring.", mount_entry_source(m));
                         return 0;
@@ -1044,14 +1062,6 @@ static int apply_mount(
         return 0;
 }
 
-/* Change per-mount flags on an existing mount */
-static int bind_remount_one(const char *path, unsigned long orig_flags, unsigned long new_flags, unsigned long flags_mask) {
-        if (mount(NULL, path, NULL, (orig_flags & ~flags_mask) | MS_REMOUNT | MS_BIND | new_flags, NULL) < 0)
-                return -errno;
-
-        return 0;
-}
-
 static int make_read_only(const MountEntry *m, char **blacklist, FILE *proc_self_mountinfo) {
         unsigned long new_flags = 0, flags_mask = 0;
         bool submounts = false;
@@ -1083,7 +1093,7 @@ static int make_read_only(const MountEntry *m, char **blacklist, FILE *proc_self
         if (submounts)
                 r = bind_remount_recursive_with_mountinfo(mount_entry_path(m), new_flags, flags_mask, blacklist, proc_self_mountinfo);
         else
-                r = bind_remount_one(mount_entry_path(m), m->flags, new_flags, flags_mask);
+                r = bind_remount_one_with_mountinfo(mount_entry_path(m), new_flags, flags_mask, proc_self_mountinfo);
 
         /* Not that we only turn on the MS_RDONLY flag here, we never turn it off. Something that was marked
          * read-only already stays this way. This improves compatibility with container managers, where we
@@ -1121,6 +1131,7 @@ static size_t namespace_calculate_mounts(
                 size_t n_temporary_filesystems,
                 const char* tmp_dir,
                 const char* var_tmp_dir,
+                const char* log_namespace,
                 ProtectHome protect_home,
                 ProtectSystem protect_system) {
 
@@ -1150,11 +1161,13 @@ static size_t namespace_calculate_mounts(
                 n_temporary_filesystems +
                 ns_info->private_dev +
                 (ns_info->protect_kernel_tunables ? ELEMENTSOF(protect_kernel_tunables_table) : 0) +
-                (ns_info->protect_control_groups ? 1 : 0) +
                 (ns_info->protect_kernel_modules ? ELEMENTSOF(protect_kernel_modules_table) : 0) +
+                (ns_info->protect_kernel_logs ? ELEMENTSOF(protect_kernel_logs_table) : 0) +
+                (ns_info->protect_control_groups ? 1 : 0) +
                 protect_home_cnt + protect_system_cnt +
                 (ns_info->protect_hostname ? 2 : 0) +
-                (namespace_info_mount_apivfs(ns_info) ? ELEMENTSOF(apivfs_table) : 0);
+                (namespace_info_mount_apivfs(ns_info) ? ELEMENTSOF(apivfs_table) : 0) +
+                !!log_namespace;
 }
 
 static void normalize_mounts(const char *root_directory, MountEntry *mounts, size_t *n_mounts) {
@@ -1168,6 +1181,57 @@ static void normalize_mounts(const char *root_directory, MountEntry *mounts, siz
         drop_outside_root(root_directory, mounts, n_mounts);
         drop_inaccessible(mounts, n_mounts);
         drop_nop(mounts, n_mounts);
+}
+
+static bool root_read_only(
+                char **read_only_paths,
+                ProtectSystem protect_system) {
+
+        /* Determine whether the root directory is going to be read-only given the configured settings. */
+
+        if (protect_system == PROTECT_SYSTEM_STRICT)
+                return true;
+
+        if (prefixed_path_strv_contains(read_only_paths, "/"))
+                return true;
+
+        return false;
+}
+
+static bool home_read_only(
+                char** read_only_paths,
+                char** inaccessible_paths,
+                char** empty_directories,
+                const BindMount *bind_mounts,
+                size_t n_bind_mounts,
+                const TemporaryFileSystem *temporary_filesystems,
+                size_t n_temporary_filesystems,
+                ProtectHome protect_home) {
+
+        size_t i;
+
+        /* Determine whether the /home directory is going to be read-only given the configured settings. Yes,
+         * this is a bit sloppy, since we don't bother checking for cases where / is affected by multiple
+         * settings. */
+
+        if (protect_home != PROTECT_HOME_NO)
+                return true;
+
+        if (prefixed_path_strv_contains(read_only_paths, "/home") ||
+            prefixed_path_strv_contains(inaccessible_paths, "/home") ||
+            prefixed_path_strv_contains(empty_directories, "/home"))
+                return true;
+
+        for (i = 0; i < n_temporary_filesystems; i++)
+                if (path_equal(temporary_filesystems[i].path, "/home"))
+                        return true;
+
+        /* If /home is overmounted with some dir from the host it's not writable. */
+        for (i = 0; i < n_bind_mounts; i++)
+                if (path_equal(bind_mounts[i].destination, "/home"))
+                        return true;
+
+        return false;
 }
 
 int setup_namespace(
@@ -1184,6 +1248,7 @@ int setup_namespace(
                 size_t n_temporary_filesystems,
                 const char* tmp_dir,
                 const char* var_tmp_dir,
+                const char *log_namespace,
                 ProtectHome protect_home,
                 ProtectSystem protect_system,
                 unsigned long mount_flags,
@@ -1208,13 +1273,18 @@ int setup_namespace(
         if (root_image) {
                 dissect_image_flags |= DISSECT_IMAGE_REQUIRE_ROOT;
 
-                if (protect_system == PROTECT_SYSTEM_STRICT &&
-                    protect_home != PROTECT_HOME_NO &&
+                /* Make the whole image read-only if we can determine that we only access it in a read-only fashion. */
+                if (root_read_only(read_only_paths,
+                                   protect_system) &&
+                    home_read_only(read_only_paths, inaccessible_paths, empty_directories,
+                                   bind_mounts, n_bind_mounts, temporary_filesystems, n_temporary_filesystems,
+                                   protect_home) &&
                     strv_isempty(read_write_paths))
                         dissect_image_flags |= DISSECT_IMAGE_READ_ONLY;
 
                 r = loop_device_make_by_path(root_image,
-                                             dissect_image_flags & DISSECT_IMAGE_READ_ONLY ? O_RDONLY : O_RDWR,
+                                             FLAGS_SET(dissect_image_flags, DISSECT_IMAGE_READ_ONLY) ? O_RDONLY : -1 /* < 0 means writable if possible, read-only as fallback */,
+                                             LO_FLAGS_PARTSCAN,
                                              &loop_device);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to create loop device for root image: %m");
@@ -1255,6 +1325,7 @@ int setup_namespace(
                         n_bind_mounts,
                         n_temporary_filesystems,
                         tmp_dir, var_tmp_dir,
+                        log_namespace,
                         protect_home, protect_system);
 
         if (n_mounts > 0) {
@@ -1322,6 +1393,12 @@ int setup_namespace(
                                 goto finish;
                 }
 
+                if (ns_info->protect_kernel_logs) {
+                        r = append_static_mounts(&m, protect_kernel_logs_table, ELEMENTSOF(protect_kernel_logs_table), ns_info->ignore_protect_paths);
+                        if (r < 0)
+                                goto finish;
+                }
+
                 if (ns_info->protect_control_groups) {
                         *(m++) = (MountEntry) {
                                 .path_const = "/sys/fs/cgroup",
@@ -1351,6 +1428,23 @@ int setup_namespace(
                         *(m++) = (MountEntry) {
                                 .path_const = "/proc/sys/kernel/domainname",
                                 .mode = READONLY,
+                        };
+                }
+
+                if (log_namespace) {
+                        _cleanup_free_ char *q;
+
+                        q = strjoin("/run/systemd/journal.", log_namespace);
+                        if (!q) {
+                                r = -ENOMEM;
+                                goto finish;
+                        }
+
+                        *(m++) = (MountEntry) {
+                                .path_const = "/run/systemd/journal",
+                                .mode = BIND_MOUNT_RECURSIVE,
+                                .read_only = true,
+                                .source_malloc = TAKE_PTR(q),
                         };
                 }
 
@@ -1525,8 +1619,9 @@ int setup_namespace(
         r = 0;
 
 finish:
-        for (m = mounts; m < mounts + n_mounts; m++)
-                mount_entry_done(m);
+        if (n_mounts > 0)
+                for (m = mounts; m < mounts + n_mounts; m++)
+                        mount_entry_done(m);
 
         free(mounts);
 
@@ -1630,6 +1725,44 @@ int temporary_filesystem_add(
         return 0;
 }
 
+static int make_tmp_prefix(const char *prefix) {
+        _cleanup_free_ char *t = NULL;
+        int r;
+
+        /* Don't do anything unless we know the dir is actually missing */
+        r = access(prefix, F_OK);
+        if (r >= 0)
+                return 0;
+        if (errno != ENOENT)
+                return -errno;
+
+        r = mkdir_parents(prefix, 0755);
+        if (r < 0)
+                return r;
+
+        r = tempfn_random(prefix, NULL, &t);
+        if (r < 0)
+                return r;
+
+        if (mkdir(t, 0777) < 0)
+                return -errno;
+
+        if (chmod(t, 01777) < 0) {
+                r = -errno;
+                (void) rmdir(t);
+                return r;
+        }
+
+        if (rename(t, prefix) < 0) {
+                r = -errno;
+                (void) rmdir(t);
+                return r == -EEXIST ? 0 : r; /* it's fine if someone else created the dir by now */
+        }
+
+        return 0;
+
+}
+
 static int setup_one_tmp_dir(const char *id, const char *prefix, char **path) {
         _cleanup_free_ char *x = NULL;
         char bid[SD_ID128_STRING_MAX];
@@ -1650,6 +1783,10 @@ static int setup_one_tmp_dir(const char *id, const char *prefix, char **path) {
         x = strjoin(prefix, "/systemd-private-", sd_id128_to_string(boot_id, bid), "-", id, "-XXXXXX");
         if (!x)
                 return -ENOMEM;
+
+        r = make_tmp_prefix(prefix);
+        if (r < 0)
+                return r;
 
         RUN_WITH_UMASK(0077)
                 if (!mkdtemp(x))

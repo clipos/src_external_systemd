@@ -5,8 +5,37 @@
 
 #include "conf-parser.h"
 #include "list.h"
-#include "../networkd-link.h"
+#include "networkd-link.h"
 #include "time-util.h"
+
+#define NETDEV_COMMON_SECTIONS "Match\0NetDev\0"
+/* This is the list of known sections. We need to ignore them in the initial parsing phase. */
+#define NETDEV_OTHER_SECTIONS                     \
+        "-Bond\0"                                 \
+        "-Bridge\0"                               \
+        "-FooOverUDP\0"                           \
+        "-GENEVE\0"                               \
+        "-IPVLAN\0"                               \
+        "-IPVTAP\0"                               \
+        "-L2TP\0"                                 \
+        "-L2TPSession\0"                          \
+        "-MACsec\0"                               \
+        "-MACsecReceiveChannel\0"                 \
+        "-MACsecTransmitAssociation\0"            \
+        "-MACsecReceiveAssociation\0"             \
+        "-MACVTAP\0"                              \
+        "-MACVLAN\0"                              \
+        "-Tunnel\0"                               \
+        "-Tun\0"                                  \
+        "-Tap\0"                                  \
+        "-Peer\0"                                 \
+        "-VLAN\0"                                 \
+        "-VRF\0"                                  \
+        "-VXCAN\0"                                \
+        "-VXLAN\0"                                \
+        "-WireGuard\0"                            \
+        "-WireGuardPeer\0"                        \
+        "-Xfrm\0"
 
 typedef struct netdev_join_callback netdev_join_callback;
 
@@ -51,6 +80,7 @@ typedef enum NetDevKind {
         NETDEV_KIND_MACSEC,
         NETDEV_KIND_NLMON,
         NETDEV_KIND_XFRM,
+        NETDEV_KIND_IFB,
         _NETDEV_KIND_MAX,
         _NETDEV_KIND_TUNNEL, /* Used by config_parse_stacked_netdev() */
         _NETDEV_KIND_INVALID = -1
@@ -156,7 +186,7 @@ extern const NetDevVTable * const netdev_vtable[_NETDEV_KIND_MAX];
 /* For casting the various netdev kinds into a netdev */
 #define NETDEV(n) (&(n)->meta)
 
-int netdev_load(Manager *manager);
+int netdev_load(Manager *manager, bool reload);
 int netdev_load_one(Manager *manager, const char *filename);
 void netdev_drop(NetDev *netdev);
 

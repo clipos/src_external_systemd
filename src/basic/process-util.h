@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
-#include <alloca.h>
 #include <errno.h>
 #include <sched.h>
 #include <signal.h>
@@ -148,16 +147,18 @@ void reset_cached_pid(void);
 int must_be_root(void);
 
 typedef enum ForkFlags {
-        FORK_RESET_SIGNALS      = 1 << 0, /* Reset all signal handlers and signal mask */
-        FORK_CLOSE_ALL_FDS      = 1 << 1, /* Close all open file descriptors in the child, except for 0,1,2 */
-        FORK_DEATHSIG           = 1 << 2, /* Set PR_DEATHSIG in the child */
-        FORK_NULL_STDIO         = 1 << 3, /* Connect 0,1,2 to /dev/null */
-        FORK_REOPEN_LOG         = 1 << 4, /* Reopen log connection */
-        FORK_LOG                = 1 << 5, /* Log above LOG_DEBUG log level about failures */
-        FORK_WAIT               = 1 << 6, /* Wait until child exited */
-        FORK_NEW_MOUNTNS        = 1 << 7, /* Run child in its own mount namespace */
-        FORK_MOUNTNS_SLAVE      = 1 << 8, /* Make child's mount namespace MS_SLAVE */
-        FORK_RLIMIT_NOFILE_SAFE = 1 << 9, /* Set RLIMIT_NOFILE soft limit to 1K for select() compat */
+        FORK_RESET_SIGNALS      = 1 <<  0, /* Reset all signal handlers and signal mask */
+        FORK_CLOSE_ALL_FDS      = 1 <<  1, /* Close all open file descriptors in the child, except for 0,1,2 */
+        FORK_DEATHSIG           = 1 <<  2, /* Set PR_DEATHSIG in the child to SIGTERM */
+        FORK_DEATHSIG_SIGINT    = 1 <<  3, /* Set PR_DEATHSIG in the child to SIGINT */
+        FORK_NULL_STDIO         = 1 <<  4, /* Connect 0,1,2 to /dev/null */
+        FORK_REOPEN_LOG         = 1 <<  5, /* Reopen log connection */
+        FORK_LOG                = 1 <<  6, /* Log above LOG_DEBUG log level about failures */
+        FORK_WAIT               = 1 <<  7, /* Wait until child exited */
+        FORK_NEW_MOUNTNS        = 1 <<  8, /* Run child in its own mount namespace */
+        FORK_MOUNTNS_SLAVE      = 1 <<  9, /* Make child's mount namespace MS_SLAVE */
+        FORK_RLIMIT_NOFILE_SAFE = 1 << 10, /* Set RLIMIT_NOFILE soft limit to 1K for select() compat */
+        FORK_STDOUT_TO_STDERR   = 1 << 11, /* Make stdout a copy of stderr */
 } ForkFlags;
 
 int safe_fork_full(const char *name, const int except_fds[], size_t n_except_fds, ForkFlags flags, pid_t *ret_pid);
@@ -172,7 +173,6 @@ int fork_agent(const char *name, const int except[], size_t n_except, pid_t *pid
 
 int set_oom_score_adjust(int value);
 
-#if SIZEOF_PID_T == 4
 /* The highest possibly (theoretic) pid_t value on this architecture. */
 #define PID_T_MAX ((pid_t) INT32_MAX)
 /* The maximum number of concurrent processes Linux allows on this architecture, as well as the highest valid PID value
@@ -182,12 +182,6 @@ int set_oom_score_adjust(int value);
  * these values are documented in proc(5) we feel quite confident that they are stable enough for the near future at
  * least to define them here too. */
 #define TASKS_MAX 4194303U
-#elif SIZEOF_PID_T == 2
-#define PID_T_MAX ((pid_t) INT16_MAX)
-#define TASKS_MAX 32767U
-#else
-#error "Unknown pid_t size"
-#endif
 
 assert_cc(TASKS_MAX <= (unsigned long) PID_T_MAX);
 
@@ -198,3 +192,7 @@ assert_cc(TASKS_MAX <= (unsigned long) PID_T_MAX);
                 (pid) = 0;                      \
                 _pid_;                          \
         })
+
+int pidfd_get_pid(int fd, pid_t *ret);
+
+int setpriority_closest(int priority);

@@ -433,7 +433,7 @@ static void assert_similar(usec_t a, usec_t b) {
         else
                 d = b - a;
 
-        assert(d < 10*USEC_PER_SEC);
+        assert_se(d < 10*USEC_PER_SEC);
 }
 
 static void test_usec_shift_clock(void) {
@@ -475,7 +475,7 @@ static void test_in_utc_timezone(void) {
         assert_se(timezone == 0);
         assert_se(daylight == 0);
 
-        assert_se(setenv("TZ", "Europe/Berlin", 1) >= 0);
+        assert_se(setenv("TZ", ":Europe/Berlin", 1) >= 0);
         assert_se(!in_utc_timezone());
         assert_se(streq(tzname[0], "CET"));
         assert_se(streq(tzname[1], "CEST"));

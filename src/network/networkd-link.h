@@ -2,6 +2,7 @@
 #pragma once
 
 #include <endian.h>
+#include <linux/nl80211.h>
 
 #include "sd-bus.h"
 #include "sd-device.h"
@@ -47,13 +48,21 @@ typedef struct Link {
         int ifindex;
         int master_ifindex;
         char *ifname;
+        char **alternative_names;
         char *kind;
         unsigned short iftype;
         char *state_file;
         struct ether_addr mac;
+        struct ether_addr permanent_mac;
         struct in6_addr ipv6ll_address;
         uint32_t mtu;
         sd_device *sd_device;
+        char *driver;
+
+        /* wlan */
+        enum nl80211_iftype wlan_iftype;
+        char *ssid;
+        struct ether_addr bssid;
 
         unsigned flags;
         uint8_t kernel_operstate;
@@ -69,8 +78,10 @@ typedef struct Link {
         unsigned address_label_messages;
         unsigned neighbor_messages;
         unsigned route_messages;
+        unsigned nexthop_messages;
         unsigned routing_policy_rule_messages;
         unsigned routing_policy_rule_remove_messages;
+        unsigned qdisc_messages;
         unsigned enslaving;
 
         Set *addresses;
@@ -79,9 +90,8 @@ typedef struct Link {
         Set *neighbors_foreign;
         Set *routes;
         Set *routes_foreign;
-
-        bool addresses_configured;
-        bool addresses_ready;
+        Set *nexthops;
+        Set *nexthops_foreign;
 
         sd_dhcp_client *dhcp_client;
         sd_dhcp_lease *dhcp_lease, *dhcp_lease_old;
@@ -89,21 +99,28 @@ typedef struct Link {
         char *lease_file;
         uint32_t original_mtu;
         unsigned dhcp4_messages;
-        bool dhcp4_configured;
-        bool dhcp6_configured;
+        bool dhcp4_route_failed:1;
+        bool dhcp4_route_retrying:1;
+        bool dhcp4_configured:1;
+        bool dhcp6_configured:1;
 
         unsigned ndisc_messages;
         bool ndisc_configured;
 
         sd_ipv4ll *ipv4ll;
         bool ipv4ll_address:1;
-        bool ipv4ll_route:1;
 
-        bool neighbors_configured;
-
-        bool static_routes_configured;
-        bool routing_policy_rules_configured;
-        bool setting_mtu;
+        bool addresses_configured:1;
+        bool addresses_ready:1;
+        bool neighbors_configured:1;
+        bool static_routes_configured:1;
+        bool static_routes_ready:1;
+        bool static_nexthops_configured:1;
+        bool routing_policy_rules_configured:1;
+        bool qdiscs_configured:1;
+        bool setting_mtu:1;
+        bool setting_genmode:1;
+        bool ipv6_mtu_set:1;
 
         LIST_HEAD(Address, pool_addresses);
 
@@ -132,7 +149,6 @@ typedef struct Link {
         /* For speed meter */
         struct rtnl_link_stats64 stats_old, stats_new;
         bool stats_updated;
-
 
         /* All kinds of DNS configuration */
         struct in_addr_data *dns;
@@ -198,6 +214,16 @@ uint32_t link_get_vrf_table(Link *link);
 uint32_t link_get_dhcp_route_table(Link *link);
 uint32_t link_get_ipv6_accept_ra_route_table(Link *link);
 int link_request_set_routes(Link *link);
+int link_request_set_nexthop(Link *link);
+
+int link_reconfigure(Link *link, bool force);
+
+int log_link_message_full_errno(Link *link, sd_netlink_message *m, int level, int err, const char *msg);
+#define log_link_message_error_errno(link, m, err, msg)   log_link_message_full_errno(link, m, LOG_ERR, err, msg)
+#define log_link_message_warning_errno(link, m, err, msg) log_link_message_full_errno(link, m, LOG_WARNING, err, msg)
+#define log_link_message_notice_errno(link, m, err, msg)  log_link_message_full_errno(link, m, LOG_NOTICE, err, msg)
+#define log_link_message_info_errno(link, m, err, msg)    log_link_message_full_errno(link, m, LOG_INFO, err, msg)
+#define log_link_message_debug_errno(link, m, err, msg)   log_link_message_full_errno(link, m, LOG_DEBUG, err, msg)
 
 #define ADDRESS_FMT_VAL(address)                   \
         be32toh((address).s_addr) >> 24,           \

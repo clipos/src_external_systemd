@@ -9,11 +9,11 @@
 #include "alloc-util.h"
 #include "ether-addr-util.h"
 #include "macro.h"
-#include "missing.h"
 #include "netlink-util.h"
 #include "socket-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
+#include "strv.h"
 #include "util.h"
 
 static void test_message_link_bridge(sd_netlink *rtnl) {
@@ -26,7 +26,7 @@ static void test_message_link_bridge(sd_netlink *rtnl) {
         assert_se(sd_netlink_message_append_u32(message, IFLA_BRPORT_COST, 10) >= 0);
         assert_se(sd_netlink_message_close_container(message) >= 0);
 
-        assert_se(sd_netlink_message_rewind(message) >= 0);
+        assert_se(sd_netlink_message_rewind(message, NULL) >= 0);
 
         assert_se(sd_netlink_message_enter_container(message, IFLA_PROTINFO) >= 0);
         assert_se(sd_netlink_message_read_u32(message, IFLA_BRPORT_COST, &cost) >= 0);
@@ -49,7 +49,7 @@ static void test_link_configure(sd_netlink *rtnl, int ifindex) {
         assert_se(sd_netlink_message_append_u32(message, IFLA_MTU, mtu) >= 0);
 
         assert_se(sd_netlink_call(rtnl, message, 0, NULL) == 1);
-        assert_se(sd_netlink_message_rewind(message) >= 0);
+        assert_se(sd_netlink_message_rewind(message, NULL) >= 0);
 
         assert_se(sd_netlink_message_read_string(message, IFLA_IFNAME, &name_out) >= 0);
         assert_se(streq(name, name_out));
@@ -128,7 +128,7 @@ static void test_address_get(sd_netlink *rtnl, int ifindex) {
 }
 
 static void test_route(sd_netlink *rtnl) {
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req;
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req = NULL;
         struct in_addr addr, addr_data;
         uint32_t index = 2, u32_data;
         int r;
@@ -153,7 +153,7 @@ static void test_route(sd_netlink *rtnl) {
                 return;
         }
 
-        assert_se(sd_netlink_message_rewind(req) >= 0);
+        assert_se(sd_netlink_message_rewind(req, NULL) >= 0);
 
         assert_se(sd_netlink_message_read_in_addr(req, RTA_GATEWAY, &addr_data) >= 0);
         assert_se(addr_data.s_addr == addr.s_addr);
@@ -439,7 +439,7 @@ static void test_container(sd_netlink *rtnl) {
         assert_se(sd_netlink_message_close_container(m) >= 0);
         assert_se(sd_netlink_message_close_container(m) == -EINVAL);
 
-        assert_se(sd_netlink_message_rewind(m) >= 0);
+        assert_se(sd_netlink_message_rewind(m, NULL) >= 0);
 
         assert_se(sd_netlink_message_enter_container(m, IFLA_LINKINFO) >= 0);
         assert_se(sd_netlink_message_read_string(m, IFLA_INFO_KIND, &string_data) >= 0);
@@ -530,7 +530,7 @@ static void test_array(void) {
         assert_se(sd_netlink_message_close_container(m) >= 0);
 
         rtnl_message_seal(m);
-        assert_se(sd_netlink_message_rewind(m) >= 0);
+        assert_se(sd_netlink_message_rewind(m, genl) >= 0);
 
         assert_se(sd_netlink_message_enter_container(m, CTRL_ATTR_MCAST_GROUPS) >= 0);
         for (unsigned i = 0; i < 10; i++) {
@@ -548,7 +548,36 @@ static void test_array(void) {
                 assert_se(streq(name, expected));
         }
         assert_se(sd_netlink_message_exit_container(m) >= 0);
+}
 
+static void test_strv(sd_netlink *rtnl) {
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
+        _cleanup_strv_free_ char **names_in = NULL, **names_out;
+        const char *p;
+
+        assert_se(sd_rtnl_message_new_link(rtnl, &m, RTM_NEWLINKPROP, 1) >= 0);
+
+        for (unsigned i = 0; i < 10; i++) {
+                char name[STRLEN("hoge") + DECIMAL_STR_MAX(uint32_t)];
+
+                xsprintf(name, "hoge%" PRIu32, i + 1000);
+                assert_se(strv_extend(&names_in, name) >= 0);
+        }
+
+        assert_se(sd_netlink_message_open_container(m, IFLA_PROP_LIST) >= 0);
+        assert_se(sd_netlink_message_append_strv(m, IFLA_ALT_IFNAME, names_in) >= 0);
+        assert_se(sd_netlink_message_close_container(m) >= 0);
+
+        rtnl_message_seal(m);
+        assert_se(sd_netlink_message_rewind(m, NULL) >= 0);
+
+        assert_se(sd_netlink_message_read_strv(m, IFLA_PROP_LIST, IFLA_ALT_IFNAME, &names_out) >= 0);
+        assert_se(strv_equal(names_in, names_out));
+
+        assert_se(sd_netlink_message_enter_container(m, IFLA_PROP_LIST) >= 0);
+        assert_se(sd_netlink_message_read_string(m, IFLA_ALT_IFNAME, &p) >= 0);
+        assert_se(streq(p, "hoge1009"));
+        assert_se(sd_netlink_message_exit_container(m) >= 0);
 }
 
 int main(void) {
@@ -569,6 +598,7 @@ int main(void) {
         test_message(rtnl);
         test_container(rtnl);
         test_array();
+        test_strv(rtnl);
 
         if_loopback = (int) if_nametoindex("lo");
         assert_se(if_loopback > 0);

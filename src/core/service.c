@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
-#include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -30,7 +29,6 @@
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
-#include "rm-rf.h"
 #include "serialize.h"
 #include "service.h"
 #include "signal-util.h"
@@ -549,9 +547,7 @@ static int service_arm_timer(Service *s, usec_t usec) {
 
 static int service_verify(Service *s) {
         assert(s);
-
-        if (UNIT(s)->load_state != UNIT_LOADED)
-                return 0;
+        assert(UNIT(s)->load_state == UNIT_LOADED);
 
         if (!s->exec_command[SERVICE_EXEC_START] && !s->exec_command[SERVICE_EXEC_STOP]
             && UNIT(s)->success_action == EMERGENCY_ACTION_NONE) {
@@ -578,8 +574,9 @@ static int service_verify(Service *s) {
                 return -ENOEXEC;
         }
 
-        if (s->type == SERVICE_ONESHOT && s->restart != SERVICE_RESTART_NO) {
-                log_unit_error(UNIT(s), "Service has Restart= setting other than no, which isn't allowed for Type=oneshot services. Refusing.");
+        if (s->type == SERVICE_ONESHOT
+            && !IN_SET(s->restart, SERVICE_RESTART_NO, SERVICE_RESTART_ON_FAILURE, SERVICE_RESTART_ON_ABNORMAL, SERVICE_RESTART_ON_WATCHDOG, SERVICE_RESTART_ON_ABORT)) {
+                log_unit_error(UNIT(s), "Service has Restart= set to either always or on-success, which isn't allowed for Type=oneshot services. Refusing.");
                 return -ENOEXEC;
         }
 
@@ -653,24 +650,37 @@ static int service_add_default_dependencies(Service *s) {
         return unit_add_two_dependencies_by_name(UNIT(s), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_SHUTDOWN_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
 }
 
-static void service_fix_output(Service *s) {
+static void service_fix_stdio(Service *s) {
         assert(s);
 
-        /* If nothing has been explicitly configured, patch default output in. If input is socket/tty we avoid this
-         * however, since in that case we want output to default to the same place as we read input from. */
-
-        if (s->exec_context.std_error == EXEC_OUTPUT_INHERIT &&
-            s->exec_context.std_output == EXEC_OUTPUT_INHERIT &&
-            s->exec_context.std_input == EXEC_INPUT_NULL)
-                s->exec_context.std_error = UNIT(s)->manager->default_std_error;
-
-        if (s->exec_context.std_output == EXEC_OUTPUT_INHERIT &&
-            s->exec_context.std_input == EXEC_INPUT_NULL)
-                s->exec_context.std_output = UNIT(s)->manager->default_std_output;
+        /* Note that EXEC_INPUT_NULL and EXEC_OUTPUT_INHERIT play a special role here: they are both the
+         * default value that is subject to automatic overriding triggered by other settings and an explicit
+         * choice the user can make. We don't distuingish between these cases currently. */
 
         if (s->exec_context.std_input == EXEC_INPUT_NULL &&
             s->exec_context.stdin_data_size > 0)
                 s->exec_context.std_input = EXEC_INPUT_DATA;
+
+        if (IN_SET(s->exec_context.std_input,
+                    EXEC_INPUT_TTY,
+                    EXEC_INPUT_TTY_FORCE,
+                    EXEC_INPUT_TTY_FAIL,
+                    EXEC_INPUT_SOCKET,
+                    EXEC_INPUT_NAMED_FD))
+                return;
+
+        /* We assume these listed inputs refer to bidirectional streams, and hence duplicating them from
+         * stdin to stdout/stderr makes sense and hence leaving EXEC_OUTPUT_INHERIT in place makes sense,
+         * too. Outputs such as regular files or sealed data memfds otoh don't really make sense to be
+         * duplicated for both input and output at the same time (since they then would cause a feedback
+         * loop), hence override EXEC_OUTPUT_INHERIT with the default stderr/stdout setting.  */
+
+        if (s->exec_context.std_error == EXEC_OUTPUT_INHERIT &&
+            s->exec_context.std_output == EXEC_OUTPUT_INHERIT)
+                s->exec_context.std_error = UNIT(s)->manager->default_std_error;
+
+        if (s->exec_context.std_output == EXEC_OUTPUT_INHERIT)
+                s->exec_context.std_output = UNIT(s)->manager->default_std_output;
 }
 
 static int service_setup_bus_name(Service *s) {
@@ -718,7 +728,7 @@ static int service_add_extras(Service *s) {
         if (s->type == SERVICE_ONESHOT && !s->start_timeout_defined)
                 s->timeout_start_usec = USEC_INFINITY;
 
-        service_fix_output(s);
+        service_fix_stdio(s);
 
         r = unit_patch_contexts(UNIT(s));
         if (r < 0)
@@ -761,32 +771,17 @@ static int service_load(Unit *u) {
         Service *s = SERVICE(u);
         int r;
 
-        assert(s);
-
-        /* Load a .service file */
-        r = unit_load_fragment(u);
+        r = unit_load_fragment_and_dropin(u, true);
         if (r < 0)
                 return r;
 
-        /* Still nothing found? Then let's give up */
-        if (u->load_state == UNIT_STUB)
-                return -ENOENT;
+        if (u->load_state != UNIT_LOADED)
+                return 0;
 
         /* This is a new unit? Then let's add in some extras */
-        if (u->load_state == UNIT_LOADED) {
-
-                /* We were able to load something, then let's add in
-                 * the dropin directories. */
-                r = unit_load_dropin(u);
-                if (r < 0)
-                        return r;
-
-                /* This is a new unit? Then let's add in some
-                 * extras */
-                r = service_add_extras(s);
-                if (r < 0)
-                        return r;
-        }
+        r = service_add_extras(s);
+        if (r < 0)
+                return r;
 
         return service_verify(s);
 }
@@ -906,7 +901,7 @@ static void service_dump(Unit *u, FILE *f, const char *prefix) {
                         prefix, s->n_fd_store_max,
                         prefix, s->n_fd_store);
 
-        cgroup_context_dump(&s->cgroup_context, f, prefix);
+        cgroup_context_dump(UNIT(s), f, prefix);
 }
 
 static int service_is_suitable_main_pid(Service *s, pid_t pid, int prio) {
@@ -958,22 +953,27 @@ static int service_load_pid_file(Service *s, bool may_warn) {
 
         prio = may_warn ? LOG_INFO : LOG_DEBUG;
 
-        fd = chase_symlinks(s->pid_file, NULL, CHASE_OPEN|CHASE_SAFE, NULL);
-        if (fd == -ENOLINK) {
-                log_unit_full(UNIT(s), LOG_DEBUG, fd, "Potentially unsafe symlink chain, will now retry with relaxed checks: %s", s->pid_file);
+        r = chase_symlinks(s->pid_file, NULL, CHASE_SAFE, NULL, &fd);
+        if (r == -ENOLINK) {
+                log_unit_full(UNIT(s), LOG_DEBUG, r,
+                              "Potentially unsafe symlink chain, will now retry with relaxed checks: %s", s->pid_file);
 
                 questionable_pid_file = true;
 
-                fd = chase_symlinks(s->pid_file, NULL, CHASE_OPEN, NULL);
+                r = chase_symlinks(s->pid_file, NULL, 0, NULL, &fd);
         }
-        if (fd < 0)
-                return log_unit_full(UNIT(s), prio, fd, "Can't open PID file %s (yet?) after %s: %m", s->pid_file, service_state_to_string(s->state));
+        if (r < 0)
+                return log_unit_full(UNIT(s), prio, fd,
+                                     "Can't open PID file %s (yet?) after %s: %m", s->pid_file, service_state_to_string(s->state));
 
-        /* Let's read the PID file now that we chased it down. But we need to convert the O_PATH fd chase_symlinks() returned us into a proper fd first. */
+        /* Let's read the PID file now that we chased it down. But we need to convert the O_PATH fd
+         * chase_symlinks() returned us into a proper fd first. */
         xsprintf(procfs, "/proc/self/fd/%i", fd);
         r = read_one_line_file(procfs, &k);
         if (r < 0)
-                return log_unit_error_errno(UNIT(s), r, "Can't convert PID files %s O_PATH file descriptor to proper file descriptor: %m", s->pid_file);
+                return log_unit_error_errno(UNIT(s), r,
+                                            "Can't convert PID files %s O_PATH file descriptor to proper file descriptor: %m",
+                                            s->pid_file);
 
         r = parse_pid(k, &pid);
         if (r < 0)
@@ -1665,21 +1665,28 @@ static int cgroup_good(Service *s) {
         return r == 0;
 }
 
-static bool service_shall_restart(Service *s) {
+static bool service_shall_restart(Service *s, const char **reason) {
         assert(s);
 
         /* Don't restart after manual stops */
-        if (s->forbid_restart)
+        if (s->forbid_restart) {
+                *reason = "manual stop";
                 return false;
+        }
 
         /* Never restart if this is configured as special exception */
-        if (exit_status_set_test(&s->restart_prevent_status, s->main_exec_status.code, s->main_exec_status.status))
+        if (exit_status_set_test(&s->restart_prevent_status, s->main_exec_status.code, s->main_exec_status.status)) {
+                *reason = "prevented by exit status";
                 return false;
+        }
 
         /* Restart if the exit code/status are configured as restart triggers */
-        if (exit_status_set_test(&s->restart_force_status,  s->main_exec_status.code, s->main_exec_status.status))
+        if (exit_status_set_test(&s->restart_force_status,  s->main_exec_status.code, s->main_exec_status.status)) {
+                *reason = "forced by exit status";
                 return true;
+        }
 
+        *reason = "restart setting";
         switch (s->restart) {
 
         case SERVICE_RESTART_NO:
@@ -1692,10 +1699,10 @@ static bool service_shall_restart(Service *s) {
                 return s->result == SERVICE_SUCCESS;
 
         case SERVICE_RESTART_ON_FAILURE:
-                return s->result != SERVICE_SUCCESS;
+                return !IN_SET(s->result, SERVICE_SUCCESS, SERVICE_SKIP_CONDITION);
 
         case SERVICE_RESTART_ON_ABNORMAL:
-                return !IN_SET(s->result, SERVICE_SUCCESS, SERVICE_FAILURE_EXIT_CODE);
+                return !IN_SET(s->result, SERVICE_SUCCESS, SERVICE_FAILURE_EXIT_CODE, SERVICE_SKIP_CONDITION);
 
         case SERVICE_RESTART_ON_WATCHDOG:
                 return s->result == SERVICE_FAILURE_WATCHDOG;
@@ -1746,8 +1753,19 @@ static void service_enter_dead(Service *s, ServiceResult f, bool allow_restart) 
                 end_state = SERVICE_FAILED;
         }
 
-        if (allow_restart && service_shall_restart(s))
-                s->will_auto_restart = true;
+        if (!allow_restart)
+                log_unit_debug(UNIT(s), "Service restart not allowed.");
+        else {
+                const char *reason;
+                bool shall_restart;
+
+                shall_restart = service_shall_restart(s, &reason);
+                log_unit_debug(UNIT(s), "Service will %srestart (%s)",
+                                        shall_restart ? "" : "not ",
+                                        reason);
+                if (shall_restart)
+                        s->will_auto_restart = true;
+        }
 
         /* Make sure service_release_resources() doesn't destroy our FD store, while we are changing through
          * SERVICE_FAILED/SERVICE_DEAD before entering into SERVICE_AUTO_RESTART. */
@@ -1839,13 +1857,17 @@ fail:
         service_enter_signal(s, SERVICE_FINAL_SIGTERM, SERVICE_FAILURE_RESOURCES);
 }
 
-static int state_to_kill_operation(ServiceState state) {
+static int state_to_kill_operation(Service *s, ServiceState state) {
         switch (state) {
 
         case SERVICE_STOP_WATCHDOG:
                 return KILL_WATCHDOG;
 
         case SERVICE_STOP_SIGTERM:
+                if (unit_has_job_type(UNIT(s), JOB_RESTART))
+                        return KILL_RESTART;
+                _fallthrough_;
+
         case SERVICE_FINAL_SIGTERM:
                 return KILL_TERMINATE;
 
@@ -1876,7 +1898,7 @@ static void service_enter_signal(Service *s, ServiceState state, ServiceResult f
         r = unit_kill_context(
                         UNIT(s),
                         &s->kill_context,
-                        state_to_kill_operation(state),
+                        state_to_kill_operation(s, state),
                         s->main_pid,
                         s->control_pid,
                         s->main_pid_alien);
@@ -2246,7 +2268,7 @@ static void service_enter_restart(Service *s) {
 
         assert(s);
 
-        if (UNIT(s)->job && UNIT(s)->job->type == JOB_STOP) {
+        if (unit_has_job_type(UNIT(s), JOB_STOP)) {
                 /* Don't restart things if we are going down anyway */
                 log_unit_info(UNIT(s), "Stop job pending for unit, delaying automatic restart.");
 
@@ -3479,6 +3501,12 @@ static void service_sigchld_event(Unit *u, pid_t pid, int code, int status) {
                                 break;
 
                         case SERVICE_STOP_POST:
+
+                                if (control_pid_good(s) <= 0)
+                                        service_enter_signal(s, SERVICE_FINAL_SIGTERM, f);
+
+                                break;
+
                         case SERVICE_FINAL_SIGTERM:
                         case SERVICE_FINAL_SIGKILL:
 
@@ -3628,6 +3656,10 @@ static void service_sigchld_event(Unit *u, pid_t pid, int code, int status) {
                                 break;
 
                         case SERVICE_STOP_POST:
+                                if (main_pid_good(s) <= 0)
+                                        service_enter_signal(s, SERVICE_FINAL_SIGTERM, f);
+                                break;
+
                         case SERVICE_FINAL_SIGTERM:
                         case SERVICE_FINAL_SIGKILL:
                                 if (main_pid_good(s) <= 0)
@@ -3749,12 +3781,12 @@ static int service_dispatch_timer(sd_event_source *source, usec_t usec, void *us
         case SERVICE_AUTO_RESTART:
                 if (s->restart_usec > 0) {
                         char buf_restart[FORMAT_TIMESPAN_MAX];
-                        log_unit_info(UNIT(s),
-                                      "Service RestartSec=%s expired, scheduling restart.",
-                                      format_timespan(buf_restart, sizeof buf_restart, s->restart_usec, USEC_PER_SEC));
+                        log_unit_debug(UNIT(s),
+                                       "Service RestartSec=%s expired, scheduling restart.",
+                                       format_timespan(buf_restart, sizeof buf_restart, s->restart_usec, USEC_PER_SEC));
                 } else
-                        log_unit_info(UNIT(s),
-                                      "Service has no hold-off time (RestartSec=0), scheduling restart.");
+                        log_unit_debug(UNIT(s),
+                                       "Service has no hold-off time (RestartSec=0), scheduling restart.");
 
                 service_enter_restart(s);
                 break;
@@ -4053,24 +4085,17 @@ static int service_get_timeout(Unit *u, usec_t *timeout) {
         return 1;
 }
 
-static void service_bus_name_owner_change(
-                Unit *u,
-                const char *old_owner,
-                const char *new_owner) {
+static void service_bus_name_owner_change(Unit *u, const char *new_owner) {
 
         Service *s = SERVICE(u);
         int r;
 
         assert(s);
 
-        assert(old_owner || new_owner);
-
-        if (old_owner && new_owner)
-                log_unit_debug(u, "D-Bus name %s changed owner from %s to %s", s->bus_name, old_owner, new_owner);
-        else if (old_owner)
-                log_unit_debug(u, "D-Bus name %s no longer registered by %s", s->bus_name, old_owner);
+        if (new_owner)
+                log_unit_debug(u, "D-Bus name %s now owned by %s", s->bus_name, new_owner);
         else
-                log_unit_debug(u, "D-Bus name %s now registered by %s", s->bus_name, new_owner);
+                log_unit_debug(u, "D-Bus name %s now not owned by anyone.", s->bus_name);
 
         s->bus_name_good = !!new_owner;
 
@@ -4246,7 +4271,6 @@ static int service_exit_status(Unit *u) {
 static int service_clean(Unit *u, ExecCleanMask mask) {
         _cleanup_strv_free_ char **l = NULL;
         Service *s = SERVICE(u);
-        pid_t pid;
         int r;
 
         assert(s);
@@ -4271,36 +4295,16 @@ static int service_clean(Unit *u, ExecCleanMask mask) {
         if (r < 0)
                 goto fail;
 
-        r = unit_fork_helper_process(UNIT(s), "(sd-rmrf)", &pid);
+        r = unit_fork_and_watch_rm_rf(u, l, &s->control_pid);
         if (r < 0)
                 goto fail;
-        if (r == 0) {
-                int ret = EXIT_SUCCESS;
-                char **i;
-
-                STRV_FOREACH(i, l) {
-                        r = rm_rf(*i, REMOVE_ROOT|REMOVE_PHYSICAL|REMOVE_MISSING_OK);
-                        if (r < 0) {
-                                log_error_errno(r, "Failed to remove '%s': %m", *i);
-                                ret = EXIT_FAILURE;
-                        }
-                }
-
-                _exit(ret);
-        }
-
-        r = unit_watch_pid(u, pid, true);
-        if (r < 0)
-                goto fail;
-
-        s->control_pid = pid;
 
         service_set_state(s, SERVICE_CLEANING);
 
         return 0;
 
 fail:
-        log_unit_warning_errno(UNIT(s), r, "Failed to initiate cleaning: %m");
+        log_unit_warning_errno(u, r, "Failed to initiate cleaning: %m");
         s->clean_result = SERVICE_FAILURE_RESOURCES;
         s->timer_event_source = sd_event_source_unref(s->timer_event_source);
         return r;
@@ -4312,6 +4316,18 @@ static int service_can_clean(Unit *u, ExecCleanMask *ret) {
         assert(s);
 
         return exec_context_get_clean_mask(&s->exec_context, ret);
+}
+
+static const char *service_finished_job(Unit *u, JobType t, JobResult result) {
+        if (t == JOB_START && result == JOB_DONE) {
+                Service *s = SERVICE(u);
+
+                if (s->type == SERVICE_ONESHOT)
+                        return "Finished %s.";
+        }
+
+        /* Fall back to generic */
+        return NULL;
 }
 
 static const char* const service_restart_table[_SERVICE_RESTART_MAX] = {
@@ -4351,9 +4367,13 @@ static const char* const service_exec_command_table[_SERVICE_EXEC_COMMAND_MAX] =
 DEFINE_STRING_TABLE_LOOKUP(service_exec_command, ServiceExecCommand);
 
 static const char* const service_exec_ex_command_table[_SERVICE_EXEC_COMMAND_MAX] = {
+        [SERVICE_EXEC_CONDITION] = "ExecConditionEx",
         [SERVICE_EXEC_START_PRE] = "ExecStartPreEx",
         [SERVICE_EXEC_START] = "ExecStartEx",
         [SERVICE_EXEC_START_POST] = "ExecStartPostEx",
+        [SERVICE_EXEC_RELOAD] = "ExecReloadEx",
+        [SERVICE_EXEC_STOP] = "ExecStopEx",
+        [SERVICE_EXEC_STOP_POST] = "ExecStopPostEx",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(service_exec_ex_command, ServiceExecCommand);
@@ -4399,6 +4419,7 @@ const UnitVTable service_vtable = {
 
         .can_transient = true,
         .can_delegate = true,
+        .can_fail = true,
 
         .init = service_init,
         .done = service_done,
@@ -4456,7 +4477,6 @@ const UnitVTable service_vtable = {
                         [1] = "Stopping %s...",
                 },
                 .finished_start_job = {
-                        [JOB_DONE]       = "Started %s.",
                         [JOB_FAILED]     = "Failed to start %s.",
                         [JOB_SKIPPED]    = "Skipped %s.",
                 },
@@ -4464,5 +4484,6 @@ const UnitVTable service_vtable = {
                         [JOB_DONE]       = "Stopped %s.",
                         [JOB_FAILED]     = "Stopped (with error) %s.",
                 },
+                .finished_job = service_finished_job,
         },
 };

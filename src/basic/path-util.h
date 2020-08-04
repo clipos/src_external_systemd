@@ -11,39 +11,35 @@
 #include "time-util.h"
 
 #define PATH_SPLIT_SBIN_BIN(x) x "sbin:" x "bin"
-#define PATH_SPLIT_BIN_SBIN(x) x "bin:" x "sbin"
 #define PATH_SPLIT_SBIN_BIN_NULSTR(x) x "sbin\0" x "bin\0"
 
 #define PATH_NORMAL_SBIN_BIN(x) x "bin"
-#define PATH_NORMAL_BIN_SBIN(x) x "bin"
 #define PATH_NORMAL_SBIN_BIN_NULSTR(x) x "bin\0"
 
 #if HAVE_SPLIT_BIN
 #  define PATH_SBIN_BIN(x) PATH_SPLIT_SBIN_BIN(x)
-#  define PATH_BIN_SBIN(x) PATH_SPLIT_BIN_SBIN(x)
 #  define PATH_SBIN_BIN_NULSTR(x) PATH_SPLIT_SBIN_BIN_NULSTR(x)
 #else
 #  define PATH_SBIN_BIN(x) PATH_NORMAL_SBIN_BIN(x)
-#  define PATH_BIN_SBIN(x) PATH_NORMAL_BIN_SBIN(x)
 #  define PATH_SBIN_BIN_NULSTR(x) PATH_NORMAL_SBIN_BIN_NULSTR(x)
 #endif
 
 #define DEFAULT_PATH_NORMAL PATH_SBIN_BIN("/usr/local/") ":" PATH_SBIN_BIN("/usr/")
-#define DEFAULT_USER_PATH_NORMAL PATH_BIN_SBIN("/usr/local/") ":" PATH_BIN_SBIN("/usr/")
 #define DEFAULT_PATH_NORMAL_NULSTR PATH_SBIN_BIN_NULSTR("/usr/local/") PATH_SBIN_BIN_NULSTR("/usr/")
 #define DEFAULT_PATH_SPLIT_USR DEFAULT_PATH_NORMAL ":" PATH_SBIN_BIN("/")
-#define DEFAULT_USER_PATH_SPLIT_USR DEFAULT_PATH_NORMAL ":" PATH_BIN_SBIN("/")
 #define DEFAULT_PATH_SPLIT_USR_NULSTR DEFAULT_PATH_NORMAL_NULSTR PATH_SBIN_BIN_NULSTR("/")
 #define DEFAULT_PATH_COMPAT PATH_SPLIT_SBIN_BIN("/usr/local/") ":" PATH_SPLIT_SBIN_BIN("/usr/") ":" PATH_SPLIT_SBIN_BIN("/")
 
 #if HAVE_SPLIT_USR
 #  define DEFAULT_PATH DEFAULT_PATH_SPLIT_USR
-#  define DEFAULT_USER_PATH DEFAULT_USER_PATH_SPLIT_USR
 #  define DEFAULT_PATH_NULSTR DEFAULT_PATH_SPLIT_USR_NULSTR
 #else
 #  define DEFAULT_PATH DEFAULT_PATH_NORMAL
-#  define DEFAULT_USER_PATH DEFAULT_USER_PATH_NORMAL
 #  define DEFAULT_PATH_NULSTR DEFAULT_PATH_NORMAL_NULSTR
+#endif
+
+#ifndef DEFAULT_USER_PATH
+#  define DEFAULT_USER_PATH DEFAULT_PATH
 #endif
 
 bool is_path(const char *p) _pure_;
@@ -75,17 +71,7 @@ static inline bool path_equal_ptr(const char *a, const char *b) {
 }
 
 /* Note: the search terminates on the first NULL item. */
-#define PATH_IN_SET(p, ...)                                     \
-        ({                                                      \
-                char **_s;                                      \
-                bool _found = false;                            \
-                STRV_FOREACH(_s, STRV_MAKE(__VA_ARGS__))        \
-                        if (path_equal(p, *_s)) {               \
-                               _found = true;                   \
-                               break;                           \
-                        }                                       \
-                _found;                                         \
-        })
+#define PATH_IN_SET(p, ...) path_strv_contains(STRV_MAKE(__VA_ARGS__), p)
 
 char* path_startswith_strv(const char *p, char **set);
 #define PATH_STARTSWITH_SET(p, ...) path_startswith_strv(p, STRV_MAKE(__VA_ARGS__))
@@ -185,3 +171,6 @@ bool empty_or_root(const char *root);
 static inline const char *empty_to_root(const char *path) {
         return isempty(path) ? "/" : path;
 }
+
+bool path_strv_contains(char **l, const char *path);
+bool prefixed_path_strv_contains(char **l, const char *path);

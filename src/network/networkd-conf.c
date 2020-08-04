@@ -4,6 +4,7 @@
  ***/
 
 #include <ctype.h>
+#include <netinet/ip.h>
 
 #include "conf-parser.h"
 #include "def.h"
@@ -14,6 +15,7 @@
 #include "networkd-manager.h"
 #include "networkd-network.h"
 #include "networkd-speed-meter.h"
+#include "networkd-dhcp4.h"
 #include "string-table.h"
 
 int manager_parse_config_file(Manager *m) {

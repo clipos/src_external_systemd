@@ -7,7 +7,7 @@
  *  - physical/geographical location of the hardware
  *  - the interface's MAC address
  *
- * http://www.freedesktop.org/wiki/Software/systemd/PredictableNetworkInterfaceNames
+ * https://systemd.io/PREDICTABLE_INTERFACE_NAMES
  *
  * When the code here is changed, man/systemd.net-naming-scheme.xml must be updated too.
  */
@@ -17,10 +17,9 @@
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
+#include <linux/if.h>
 #include <linux/pci_regs.h>
 
 #include "alloc-util.h"
@@ -28,7 +27,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "naming-scheme.h"
+#include "netif-naming-scheme.h"
 #include "parse-util.h"
 #include "proc-cmdline.h"
 #include "stdio-util.h"
@@ -58,22 +57,22 @@ struct netnames {
         bool mac_valid;
 
         sd_device *pcidev;
-        char pci_slot[IFNAMSIZ];
-        char pci_path[IFNAMSIZ];
-        char pci_onboard[IFNAMSIZ];
+        char pci_slot[ALTIFNAMSIZ];
+        char pci_path[ALTIFNAMSIZ];
+        char pci_onboard[ALTIFNAMSIZ];
         const char *pci_onboard_label;
 
-        char usb_ports[IFNAMSIZ];
-        char bcma_core[IFNAMSIZ];
-        char ccw_busid[IFNAMSIZ];
-        char vio_slot[IFNAMSIZ];
-        char platform_path[IFNAMSIZ];
-        char netdevsim_path[IFNAMSIZ];
+        char usb_ports[ALTIFNAMSIZ];
+        char bcma_core[ALTIFNAMSIZ];
+        char ccw_busid[ALTIFNAMSIZ];
+        char vio_slot[ALTIFNAMSIZ];
+        char platform_path[ALTIFNAMSIZ];
+        char netdevsim_path[ALTIFNAMSIZ];
 };
 
 struct virtfn_info {
         sd_device *physfn_pcidev;
-        char suffix[IFNAMSIZ];
+        char suffix[ALTIFNAMSIZ];
 };
 
 /* skip intermediate virtio devices */
@@ -106,7 +105,7 @@ static int get_virtfn_info(sd_device *dev, struct netnames *names, struct virtfn
         _cleanup_free_ char *virtfn_pci_syspath = NULL;
         struct dirent *dent;
         _cleanup_closedir_ DIR *dir = NULL;
-        char suffix[IFNAMSIZ];
+        char suffix[ALTIFNAMSIZ];
         int r;
 
         assert(dev);
@@ -119,7 +118,7 @@ static int get_virtfn_info(sd_device *dev, struct netnames *names, struct virtfn
 
         /* Check if this is a virtual function. */
         physfn_link_file = strjoina(syspath, "/physfn");
-        r = chase_symlinks(physfn_link_file, NULL, 0, &physfn_pci_syspath);
+        r = chase_symlinks(physfn_link_file, NULL, 0, &physfn_pci_syspath, NULL);
         if (r < 0)
                 return r;
 
@@ -143,7 +142,7 @@ static int get_virtfn_info(sd_device *dev, struct netnames *names, struct virtfn
                 if (!virtfn_link_file)
                         return -ENOMEM;
 
-                if (chase_symlinks(virtfn_link_file, NULL, 0, &virtfn_pci_syspath) < 0)
+                if (chase_symlinks(virtfn_link_file, NULL, 0, &virtfn_pci_syspath, NULL) < 0)
                         continue;
 
                 if (streq(syspath, virtfn_pci_syspath)) {
@@ -331,8 +330,9 @@ static int dev_pci_slot(sd_device *dev, struct netnames *names) {
                         char str[PATH_MAX];
                         _cleanup_free_ char *address = NULL;
 
-                        if (dent->d_name[0] == '.')
+                        if (dot_or_dot_dot(dent->d_name))
                                 continue;
+
                         r = safe_atou_full(dent->d_name, 10, &i);
                         if (r < 0 || i <= 0)
                                 continue;
@@ -821,7 +821,7 @@ static int builtin_net_id(sd_device *dev, int argc, char *argv[], bool test) {
 
         r = names_mac(dev, &names);
         if (r >= 0 && names.mac_valid) {
-                char str[IFNAMSIZ];
+                char str[ALTIFNAMSIZ];
 
                 xsprintf(str, "%sx%02x%02x%02x%02x%02x%02x", prefix,
                          names.mac[0], names.mac[1], names.mac[2],
@@ -833,7 +833,7 @@ static int builtin_net_id(sd_device *dev, int argc, char *argv[], bool test) {
 
         /* get path names for Linux on System z network devices */
         if (names_ccw(dev, &names) >= 0 && names.type == NET_CCW) {
-                char str[IFNAMSIZ];
+                char str[ALTIFNAMSIZ];
 
                 if (snprintf_ok(str, sizeof str, "%s%s", prefix, names.ccw_busid))
                         udev_builtin_add_property(dev, test, "ID_NET_NAME_PATH", str);
@@ -842,7 +842,7 @@ static int builtin_net_id(sd_device *dev, int argc, char *argv[], bool test) {
 
         /* get ibmveth/ibmvnic slot-based names. */
         if (names_vio(dev, &names) >= 0 && names.type == NET_VIO) {
-                char str[IFNAMSIZ];
+                char str[ALTIFNAMSIZ];
 
                 if (snprintf_ok(str, sizeof str, "%s%s", prefix, names.vio_slot))
                         udev_builtin_add_property(dev, test, "ID_NET_NAME_SLOT", str);
@@ -851,7 +851,7 @@ static int builtin_net_id(sd_device *dev, int argc, char *argv[], bool test) {
 
         /* get ACPI path names for ARM64 platform devices */
         if (names_platform(dev, &names, test) >= 0 && names.type == NET_PLATFORM) {
-                char str[IFNAMSIZ];
+                char str[ALTIFNAMSIZ];
 
                 if (snprintf_ok(str, sizeof str, "%s%s", prefix, names.platform_path))
                         udev_builtin_add_property(dev, test, "ID_NET_NAME_PATH", str);
@@ -860,7 +860,7 @@ static int builtin_net_id(sd_device *dev, int argc, char *argv[], bool test) {
 
         /* get netdevsim path names */
         if (names_netdevsim(dev, &names) >= 0 && names.type == NET_NETDEVSIM) {
-                char str[IFNAMSIZ];
+                char str[ALTIFNAMSIZ];
 
                 if (snprintf_ok(str, sizeof str, "%s%s", prefix, names.netdevsim_path))
                         udev_builtin_add_property(dev, test, "ID_NET_NAME_PATH", str);
@@ -874,7 +874,7 @@ static int builtin_net_id(sd_device *dev, int argc, char *argv[], bool test) {
 
         /* plain PCI device */
         if (names.type == NET_PCI) {
-                char str[IFNAMSIZ];
+                char str[ALTIFNAMSIZ];
 
                 if (names.pci_onboard[0] &&
                     snprintf_ok(str, sizeof str, "%s%s", prefix, names.pci_onboard))
@@ -898,7 +898,7 @@ static int builtin_net_id(sd_device *dev, int argc, char *argv[], bool test) {
 
         /* USB device */
         if (names_usb(dev, &names) >= 0 && names.type == NET_USB) {
-                char str[IFNAMSIZ];
+                char str[ALTIFNAMSIZ];
 
                 if (names.pci_path[0] &&
                     snprintf_ok(str, sizeof str, "%s%s%s", prefix, names.pci_path, names.usb_ports))
@@ -912,7 +912,7 @@ static int builtin_net_id(sd_device *dev, int argc, char *argv[], bool test) {
 
         /* Broadcom bus */
         if (names_bcma(dev, &names) >= 0 && names.type == NET_BCMA) {
-                char str[IFNAMSIZ];
+                char str[ALTIFNAMSIZ];
 
                 if (names.pci_path[0] &&
                     snprintf_ok(str, sizeof str, "%s%s%s", prefix, names.pci_path, names.bcma_core))

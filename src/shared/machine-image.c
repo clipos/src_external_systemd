@@ -1,16 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/fs.h>
+#include <linux/loop.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <linux/fs.h>
 
 #include "alloc-util.h"
 #include "btrfs-util.h"
@@ -1113,7 +1112,7 @@ int image_read_metadata(Image *i) {
                 _cleanup_free_ char *hostname = NULL;
                 _cleanup_free_ char *path = NULL;
 
-                r = chase_symlinks("/etc/hostname", i->path, CHASE_PREFIX_ROOT|CHASE_TRAIL_SLASH, &path);
+                r = chase_symlinks("/etc/hostname", i->path, CHASE_PREFIX_ROOT|CHASE_TRAIL_SLASH, &path, NULL);
                 if (r < 0 && r != -ENOENT)
                         log_debug_errno(r, "Failed to chase /etc/hostname in image %s: %m", i->name);
                 else if (r >= 0) {
@@ -1124,7 +1123,7 @@ int image_read_metadata(Image *i) {
 
                 path = mfree(path);
 
-                r = chase_symlinks("/etc/machine-id", i->path, CHASE_PREFIX_ROOT|CHASE_TRAIL_SLASH, &path);
+                r = chase_symlinks("/etc/machine-id", i->path, CHASE_PREFIX_ROOT|CHASE_TRAIL_SLASH, &path, NULL);
                 if (r < 0 && r != -ENOENT)
                         log_debug_errno(r, "Failed to chase /etc/machine-id in image %s: %m", i->name);
                 else if (r >= 0) {
@@ -1142,7 +1141,7 @@ int image_read_metadata(Image *i) {
 
                 path = mfree(path);
 
-                r = chase_symlinks("/etc/machine-info", i->path, CHASE_PREFIX_ROOT|CHASE_TRAIL_SLASH, &path);
+                r = chase_symlinks("/etc/machine-info", i->path, CHASE_PREFIX_ROOT|CHASE_TRAIL_SLASH, &path, NULL);
                 if (r < 0 && r != -ENOENT)
                         log_debug_errno(r, "Failed to chase /etc/machine-info in image %s: %m", i->name);
                 else if (r >= 0) {
@@ -1168,11 +1167,11 @@ int image_read_metadata(Image *i) {
                 _cleanup_(loop_device_unrefp) LoopDevice *d = NULL;
                 _cleanup_(dissected_image_unrefp) DissectedImage *m = NULL;
 
-                r = loop_device_make_by_path(i->path, O_RDONLY, &d);
+                r = loop_device_make_by_path(i->path, O_RDONLY, LO_FLAGS_PARTSCAN, &d);
                 if (r < 0)
                         return r;
 
-                r = dissect_image(d->fd, NULL, 0, DISSECT_IMAGE_REQUIRE_ROOT, &m);
+                r = dissect_image(d->fd, NULL, 0, DISSECT_IMAGE_REQUIRE_ROOT|DISSECT_IMAGE_RELAX_VAR_CHECK, &m);
                 if (r < 0)
                         return r;
 

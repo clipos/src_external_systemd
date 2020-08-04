@@ -1,11 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/magic.h>
 #include <sched.h>
-#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -15,7 +12,8 @@
 #include "fd-util.h"
 #include "fs-util.h"
 #include "macro.h"
-#include "missing.h"
+#include "missing_fs.h"
+#include "missing_magic.h"
 #include "parse-util.h"
 #include "stat-util.h"
 #include "string-util.h"
@@ -96,10 +94,10 @@ bool null_or_empty(struct stat *st) {
         if (S_ISREG(st->st_mode) && st->st_size <= 0)
                 return true;
 
-        /* We don't want to hardcode the major/minor of /dev/null,
-         * hence we do a simpler "is this a device node?" check. */
+        /* We don't want to hardcode the major/minor of /dev/null, hence we do a simpler "is this a character
+         * device node?" check. */
 
-        if (S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode))
+        if (S_ISCHR(st->st_mode))
                 return true;
 
         return false;
@@ -109,6 +107,10 @@ int null_or_empty_path(const char *fn) {
         struct stat st;
 
         assert(fn);
+
+        /* If we have the path, let's do an easy text comparison first. */
+        if (path_equal(fn, "/dev/null"))
+                return true;
 
         if (stat(fn, &st) < 0)
                 return -errno;
@@ -180,13 +182,12 @@ int fd_is_fs_type(int fd, statfs_f_type_t magic_value) {
 }
 
 int path_is_fs_type(const char *path, statfs_f_type_t magic_value) {
-        _cleanup_close_ int fd = -1;
+        struct statfs s;
 
-        fd = open(path, O_RDONLY|O_CLOEXEC|O_NOCTTY|O_PATH);
-        if (fd < 0)
+        if (statfs(path, &s) < 0)
                 return -errno;
 
-        return fd_is_fs_type(fd, magic_value);
+        return is_fs_type(&s, magic_value);
 }
 
 bool is_temporary_fs(const struct statfs *s) {
@@ -335,7 +336,7 @@ int device_path_make_canonical(mode_t mode, dev_t devno, char **ret) {
         if (r < 0)
                 return r;
 
-        return chase_symlinks(p, NULL, 0, ret);
+        return chase_symlinks(p, NULL, 0, ret, NULL);
 }
 
 int device_path_parse_major_minor(const char *path, mode_t *ret_mode, dev_t *ret_devno) {

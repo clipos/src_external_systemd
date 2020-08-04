@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 TEST_DESCRIPTION="https://github.com/systemd/systemd/issues/3171"
 TEST_NO_QEMU=1
@@ -14,15 +14,8 @@ test_setup() {
         eval $(udevadm info --export --query=env --name=${LOOPDEV}p2)
 
         setup_basic_environment
+        mask_supporting_services
         dracut_install cat mv stat nc
-
-        # mask some services that we do not want to run in these tests
-        ln -fs /dev/null $initdir/etc/systemd/system/systemd-hwdb-update.service
-        ln -fs /dev/null $initdir/etc/systemd/system/systemd-journal-catalog-update.service
-        ln -fs /dev/null $initdir/etc/systemd/system/systemd-networkd.service
-        ln -fs /dev/null $initdir/etc/systemd/system/systemd-networkd.socket
-        ln -fs /dev/null $initdir/etc/systemd/system/systemd-resolved.service
-        ln -fs /dev/null $initdir/etc/systemd/system/systemd-machined.service
 
         # setup the testsuite service
         cat >$initdir/etc/systemd/system/testsuite.service <<EOF
@@ -36,7 +29,7 @@ Type=oneshot
 EOF
 
         cat >$initdir/test-socket-group.sh <<'EOF'
-#!/bin/bash
+#!/usr/bin/env bash
 set -x
 set -e
 set -o pipefail

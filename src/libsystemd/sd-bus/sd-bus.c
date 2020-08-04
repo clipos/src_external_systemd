@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -34,7 +35,7 @@
 #include "hostname-util.h"
 #include "macro.h"
 #include "memory-util.h"
-#include "missing.h"
+#include "missing_syscall.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
@@ -536,29 +537,41 @@ static int hello_callback(sd_bus_message *reply, void *userdata, sd_bus_error *e
         assert(IN_SET(bus->state, BUS_HELLO, BUS_CLOSING));
 
         r = sd_bus_message_get_errno(reply);
-        if (r > 0)
-                return -r;
+        if (r > 0) {
+                r = -r;
+                goto fail;
+        }
 
         r = sd_bus_message_read(reply, "s", &s);
         if (r < 0)
-                return r;
+                goto fail;
 
-        if (!service_name_is_valid(s) || s[0] != ':')
-                return -EBADMSG;
+        if (!service_name_is_valid(s) || s[0] != ':') {
+                r = -EBADMSG;
+                goto fail;
+        }
 
         r = free_and_strdup(&bus->unique_name, s);
         if (r < 0)
-                return r;
+                goto fail;
 
         if (bus->state == BUS_HELLO) {
                 bus_set_state(bus, BUS_RUNNING);
 
                 r = synthesize_connected_signal(bus);
                 if (r < 0)
-                        return r;
+                        goto fail;
         }
 
         return 1;
+
+fail:
+        /* When Hello() failed, let's propagate this in two ways: first we return the error immediately here,
+         * which is the propagated up towards the event loop. Let's also invalidate the connection, so that
+         * if the user then calls back into us again we won't wait any longer. */
+
+        bus_set_state(bus, BUS_CLOSING);
+        return r;
 }
 
 static int bus_send_hello(sd_bus *bus) {
@@ -2659,7 +2672,7 @@ static int process_builtin(sd_bus *bus, sd_bus_message *m) {
                 r = sd_bus_message_new_method_return(m, &reply);
         else if (streq_ptr(m->member, "GetMachineId")) {
                 sd_id128_t id;
-                char sid[33];
+                char sid[SD_ID128_STRING_MAX];
 
                 r = sd_id128_get_machine(&id);
                 if (r < 0)
@@ -4193,4 +4206,28 @@ _public_ int sd_bus_get_close_on_exit(sd_bus *bus) {
         assert_return(bus = bus_resolve(bus), -ENOPKG);
 
         return bus->close_on_exit;
+}
+
+_public_ int sd_bus_enqueue_for_read(sd_bus *bus, sd_bus_message *m) {
+        int r;
+
+        assert_return(bus, -EINVAL);
+        assert_return(bus = bus_resolve(bus), -ENOPKG);
+        assert_return(m, -EINVAL);
+        assert_return(m->sealed, -EINVAL);
+        assert_return(!bus_pid_changed(bus), -ECHILD);
+
+        if (!BUS_IS_OPEN(bus->state))
+                return -ENOTCONN;
+
+        /* Re-enqueue a message for reading. This is primarily useful for PolicyKit-style authentication,
+         * where we accept a message, then determine we need to interactively authenticate the user, and then
+         * we want to process the message again. */
+
+        r = bus_rqueue_make_room(bus);
+        if (r < 0)
+                return r;
+
+        bus->rqueue[bus->rqueue_size++] = bus_message_ref_queued(m, bus);
+        return 0;
 }

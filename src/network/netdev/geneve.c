@@ -2,19 +2,16 @@
 
 #include <net/if.h>
 
-#include "sd-netlink.h"
-
 #include "alloc-util.h"
 #include "conf-parser.h"
 #include "extract-word.h"
 #include "geneve.h"
 #include "netlink-util.h"
+#include "networkd-manager.h"
 #include "parse-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
-#include "missing.h"
-#include "networkd-manager.h"
 
 #define GENEVE_FLOW_LABEL_MAX_MASK 0xFFFFFU
 #define DEFAULT_GENEVE_DESTINATION_PORT 6081
@@ -351,7 +348,7 @@ static void geneve_init(NetDev *netdev) {
 const NetDevVTable geneve_vtable = {
         .object_size = sizeof(Geneve),
         .init = geneve_init,
-        .sections = "Match\0NetDev\0GENEVE\0",
+        .sections = NETDEV_COMMON_SECTIONS "GENEVE\0",
         .create = netdev_geneve_create,
         .create_type = NETDEV_CREATE_INDEPENDENT,
         .config_verify = netdev_geneve_verify,

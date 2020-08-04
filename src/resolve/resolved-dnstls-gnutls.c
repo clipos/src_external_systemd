@@ -9,7 +9,7 @@
 #include "resolved-dns-stream.h"
 #include "resolved-dnstls.h"
 
-#define PRIORTY_STRING "NORMAL:-VERS-ALL:+VERS-TLS1.3:+VERS-TLS1.2"
+#define TLS_PROTOCOL_PRIORITY "NORMAL:-VERS-ALL:+VERS-TLS1.3:+VERS-TLS1.2"
 DEFINE_TRIVIAL_CLEANUP_FUNC(gnutls_session_t, gnutls_deinit);
 
 static ssize_t dnstls_stream_writev(gnutls_transport_ptr_t p, const giovec_t *iov, int iovcnt) {
@@ -27,7 +27,7 @@ static ssize_t dnstls_stream_writev(gnutls_transport_ptr_t p, const giovec_t *io
 }
 
 int dnstls_stream_connect_tls(DnsStream *stream, DnsServer *server) {
-        _cleanup_(gnutls_deinitp) gnutls_session_t gs;
+        _cleanup_(gnutls_deinitp) gnutls_session_t gs = NULL;
         int r;
 
         assert(stream);
@@ -38,7 +38,7 @@ int dnstls_stream_connect_tls(DnsStream *stream, DnsServer *server) {
                 return r;
 
         /* As DNS-over-TLS is a recent protocol, older TLS versions can be disabled */
-        r = gnutls_priority_set_direct(gs, PRIORTY_STRING, NULL);
+        r = gnutls_priority_set_direct(gs, TLS_PROTOCOL_PRIORITY, NULL);
         if (r < 0)
                 return r;
 
@@ -65,6 +65,12 @@ int dnstls_stream_connect_tls(DnsStream *stream, DnsServer *server) {
                         stream->dnstls_data.validation.size = 16;
                 }
                 gnutls_session_set_verify_cert2(gs, &stream->dnstls_data.validation, 1, 0);
+        }
+
+        if (server->server_name) {
+                r = gnutls_server_name_set(gs, GNUTLS_NAME_DNS, server->server_name, strlen(server->server_name));
+                if (r < 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to set server name: %s", gnutls_strerror(r));
         }
 
         gnutls_handshake_set_timeout(gs, GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT);

@@ -217,8 +217,7 @@
             this notification message has been sent. If this option is used, <varname>NotifyAccess=</varname> (see
             below) should be set to open access to the notification socket provided by systemd. If
             <varname>NotifyAccess=</varname> is missing or set to <option>none</option>, it will be forcibly set to
-            <option>main</option>. Note that currently <varname>Type=</varname><option>notify</option> will not work if
-            used in combination with <varname>PrivateNetwork=</varname><option>yes</option>.</para></listitem>
+            <option>main</option></para></listitem>.
 
             <listitem><para>Behavior of <option>idle</option> is very similar to <option>simple</option>; however,
             actual execution of the service program is delayed until all active jobs are dispatched. This may be used
@@ -424,6 +423,9 @@
         <varname>ExecStart=</varname>, or <varname>ExecStartPost=</varname> fail (and are not prefixed with
         <literal>-</literal>, see above) or time out before the service is fully up, execution continues with commands
         specified in <varname>ExecStopPost=</varname>, the commands in <varname>ExecStop=</varname> are skipped.</para>
+
+        <para>Note that the execution of <varname>ExecStartPost=</varname> is taken into account for the purpose of
+        <varname>Before=</varname>/<varname>After=</varname> ordering constraints.</para>
         </listitem>
       </varlistentry>
 
@@ -477,26 +479,24 @@
 
       <varlistentry>
         <term><varname>ExecStop=</varname></term>
-        <listitem><para>Commands to execute to stop the service
-        started via <varname>ExecStart=</varname>. This argument takes
-        multiple command lines, following the same scheme as described
-        for <varname>ExecStart=</varname> above. Use of this setting
-        is optional. After the commands configured in this option are
-        run, it is implied that the service is stopped, and any processes
-        remaining for it are terminated
-        according to the <varname>KillMode=</varname> setting (see
+        <listitem><para>Commands to execute to stop the service started via
+        <varname>ExecStart=</varname>. This argument takes multiple command lines, following the same scheme
+        as described for <varname>ExecStart=</varname> above. Use of this setting is optional. After the
+        commands configured in this option are run, it is implied that the service is stopped, and any
+        processes remaining for it are terminated according to the <varname>KillMode=</varname> setting (see
         <citerefentry><refentrytitle>systemd.kill</refentrytitle><manvolnum>5</manvolnum></citerefentry>).
-        If this option is not specified, the process is terminated by
-        sending the signal specified in <varname>KillSignal=</varname>
-        when service stop is requested. Specifier and environment
-        variable substitution is supported (including
+        If this option is not specified, the process is terminated by sending the signal specified in
+        <varname>KillSignal=</varname> or <varname>RestartKillSignal=</varname> when service stop is
+        requested. Specifier and environment variable substitution is supported (including
         <varname>$MAINPID</varname>, see above).</para>
 
-        <para>Note that it is usually not sufficient to specify a command for this setting that only asks the service
-        to terminate (for example, by queuing some form of termination signal for it), but does not wait for it to do
-        so. Since the remaining processes of the services are killed according to <varname>KillMode=</varname> and
-        <varname>KillSignal=</varname> as described above immediately after the command exited, this may not result in
-        a clean stop. The specified command should hence be a synchronous operation, not an asynchronous one.</para>
+        <para>Note that it is usually not sufficient to specify a command for this setting that only asks the
+        service to terminate (for example, by sending some form of termination signal to it), but does not
+        wait for it to do so. Since the remaining processes of the services are killed according to
+        <varname>KillMode=</varname> and <varname>KillSignal=</varname> or
+        <varname>RestartKillSignal=</varname> as described above immediately after the command exited, this
+        may not result in a clean stop. The specified command should hence be a synchronous operation, not an
+        asynchronous one.</para>
 
         <para>Note that the commands specified in <varname>ExecStop=</varname> are only executed when the service
         started successfully first. They are not invoked if the service was never started at all, or in case its
@@ -537,7 +537,10 @@
         service, as well as the main process' exit code and status, set in the <varname>$SERVICE_RESULT</varname>,
         <varname>$EXIT_CODE</varname> and <varname>$EXIT_STATUS</varname> environment variables, see
         <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
-        details.</para></listitem>
+        details.</para>
+
+        <para>Note that the execution of <varname>ExecStopPost=</varname> is taken into account for the purpose of
+        <varname>Before=</varname>/<varname>After=</varname> ordering constraints.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -576,8 +579,8 @@
       <varlistentry>
         <term><varname>TimeoutStopSec=</varname></term>
         <listitem><para>This option serves two purposes. First, it configures the time to wait for each
-        <constant>ExecStop=</constant> command. If any of them times out, subsequent <constant>ExecStop=</constant> commands
-        are skipped and the service will be terminated by <constant>SIGTERM</constant>. If no <constant>ExecStop=</constant>
+        <varname>ExecStop=</varname> command. If any of them times out, subsequent <varname>ExecStop=</varname> commands
+        are skipped and the service will be terminated by <constant>SIGTERM</constant>. If no <varname>ExecStop=</varname>
         commands are specified, the service gets the <constant>SIGTERM</constant> immediately. Second, it configures the time
         to wait for the service itself to stop. If it doesn't terminate in the specified time, it will be forcibly terminated
         by <constant>SIGKILL</constant> (see <varname>KillMode=</varname> in
@@ -842,35 +845,41 @@
 
       <varlistentry>
         <term><varname>SuccessExitStatus=</varname></term>
+
         <listitem><para>Takes a list of exit status definitions that, when returned by the main service
-        process, will be considered successful termination, in addition to the normal successful exit code 0
-        and the signals <constant>SIGHUP</constant>, <constant>SIGINT</constant>,
+        process, will be considered successful termination, in addition to the normal successful exit status
+        0 and the signals <constant>SIGHUP</constant>, <constant>SIGINT</constant>,
         <constant>SIGTERM</constant>, and <constant>SIGPIPE</constant>. Exit status definitions can be
-        numeric exit codes, termination code names, or termination signal names, separated by spaces. See the
-        Process Exit Codes section in
+        numeric termination statuses, termination status names, or termination signal names, separated by
+        spaces. See the Process Exit Codes section in
         <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
-        a list of termination codes names (for this setting only the part without the
-        <literal>EXIT_</literal> or <literal>EX_</literal> prefix should be used). See
-        <citerefentry project='man-pages'><refentrytitle>signal</refentrytitle><manvolnum>7</manvolnum></citerefentry> for
+        a list of termination status names (for this setting only the part without the
+        <literal>EXIT_</literal> or <literal>EX_</literal> prefix should be used). See <citerefentry
+        project='man-pages'><refentrytitle>signal</refentrytitle><manvolnum>7</manvolnum></citerefentry> for
         a list of signal names.</para>
 
-        <para>This option may appear more than once, in which case the
-        list of successful exit statuses is merged. If the empty
-        string is assigned to this option, the list is reset, all
-        prior assignments of this option will have no
-        effect.</para>
+        <para>Note that this setting does not change the the mapping between numeric exit statuses and their
+        names, i.e. regardless how this setting is used 0 will still be mapped to <literal>SUCCESS</literal>
+        (and thus typically shown as <literal>0/SUCCESS</literal> in tool outputs) and 1 to
+        <literal>FAILURE</literal> (and thus typically shown as <literal>1/FAILURE</literal>), and so on. It
+        only controls what happens as effect of these exit statuses, and how it propagates to the state of
+        the service as a whole.</para>
+
+        <para>This option may appear more than once, in which case the list of successful exit statuses is
+        merged. If the empty string is assigned to this option, the list is reset, all prior assignments of
+        this option will have no effect.</para>
 
         <example>
-          <title>A service with with the the <varname>SuccessExitStatus=</varname> setting</title>
+          <title>A service with with the <varname>SuccessExitStatus=</varname> setting</title>
 
           <programlisting>SuccessExitStatus=TEMPFAIL 250 SIGUSR1</programlisting>
 
-          <para>Exit codes 75 (<constant>TEMPFAIL</constant>), 250, and the termination signal
+          <para>Exit status 75 (<constant>TEMPFAIL</constant>), 250, and the termination signal
           <constant>SIGKILL</constant> are considered clean service terminations.</para>
         </example>
 
-        <para>Note: <command>systemd-analyze exit-codes</command> may be used to list exit
-        codes and translate between numerical code values and names.</para></listitem>
+        <para>Note: <command>systemd-analyze exit-status</command> may be used to list exit statuses and
+        translate between numerical status values and names.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -1103,10 +1112,10 @@
 
     <para>Basic environment variable substitution is supported. Use
     <literal>${FOO}</literal> as part of a word, or as a word of its
-    own, on the command line, in which case it will be replaced by the
-    value of the environment variable including all whitespace it
-    contains, resulting in a single argument. Use
-    <literal>$FOO</literal> as a separate word on the command line, in
+    own, on the command line, in which case it will be erased and replaced
+    by the exact value of the environment variable (if any) including all
+    whitespace it contains, always resulting in exactly a single argument.
+    Use <literal>$FOO</literal> as a separate word on the command line, in
     which case it will be replaced by the value of the environment
     variable split at whitespace, resulting in zero or more arguments.
     For this type of expansion, quotes are respected when splitting
@@ -1330,9 +1339,10 @@ WantedBy=multi-user.target</programlisting>
 
       <para><varname>Type=</varname><option>oneshot</option> are the
       only service units that may have more than one
-      <varname>ExecStart=</varname> specified. They will be executed
-      in order until either they are all successful or one of them
-      fails.</para>
+      <varname>ExecStart=</varname> specified. For units with multiple
+      commands (<varname index="false">Type=oneshot</varname>), all commands will be run again.</para>
+      <para> For <varname index="false">Type=oneshot</varname>, <varname>Restart=</varname><option>always</option>
+      and <varname>Restart=</varname><option>on-success</option> are <emphasis>not</emphasis> allowed.</para>
     </example>
 
     <example>

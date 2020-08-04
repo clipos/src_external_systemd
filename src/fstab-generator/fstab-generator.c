@@ -1,9 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
-#include <mntent.h>
 #include <stdio.h>
-#include <string.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
@@ -114,14 +112,23 @@ static int add_swap(
         if (r < 0)
                 return log_error_errno(r, "Failed to generate unit name: %m");
 
-        r = generator_open_unit_file(arg_dest, "/etc/fstab", name, &f);
+        r = generator_open_unit_file(arg_dest, fstab_path(), name, &f);
         if (r < 0)
                 return r;
 
-        fputs("[Unit]\n"
-              "SourcePath=/etc/fstab\n"
-              "Documentation=man:fstab(5) man:systemd-fstab-generator(8)\n\n"
-              "[Swap]\n", f);
+        fprintf(f,
+                "[Unit]\n"
+                "Documentation=man:fstab(5) man:systemd-fstab-generator(8)\n"
+                "SourcePath=%s\n",
+                fstab_path());
+
+        r = generator_write_blockdev_dependency(f, what);
+        if (r < 0)
+                return r;
+
+        fprintf(f,
+                "\n"
+                "[Swap]\n");
 
         r = write_what(f, what);
         if (r < 0)
@@ -174,8 +181,13 @@ static bool mount_in_initrd(struct mntent *me) {
                streq(me->mnt_dir, "/usr");
 }
 
-static int write_timeout(FILE *f, const char *where, const char *opts,
-                         const char *filter, const char *variable) {
+static int write_timeout(
+                FILE *f,
+                const char *where,
+                const char *opts,
+                const char *filter,
+                const char *variable) {
+
         _cleanup_free_ char *timeout = NULL;
         char timespan[FORMAT_TIMESPAN_MAX];
         usec_t u;
@@ -208,8 +220,12 @@ static int write_mount_timeout(FILE *f, const char *where, const char *opts) {
                              "x-systemd.mount-timeout\0", "TimeoutSec");
 }
 
-static int write_dependency(FILE *f, const char *opts,
-                const char *filter, const char *format) {
+static int write_dependency(
+                FILE *f,
+                const char *opts,
+                const char *filter,
+                const char *format) {
+
         _cleanup_strv_free_ char **names = NULL, **units = NULL;
         _cleanup_free_ char *res = NULL;
         char **s;
@@ -227,9 +243,10 @@ static int write_dependency(FILE *f, const char *opts,
         STRV_FOREACH(s, names) {
                 char *x;
 
-                r = unit_name_mangle_with_suffix(*s, 0, ".mount", &x);
+                r = unit_name_mangle_with_suffix(*s, "as dependency", 0, ".mount", &x);
                 if (r < 0)
                         return log_error_errno(r, "Failed to generate unit name: %m");
+
                 r = strv_consume(&units, x);
                 if (r < 0)
                         return log_oom();
@@ -249,7 +266,8 @@ static int write_dependency(FILE *f, const char *opts,
 }
 
 static int write_after(FILE *f, const char *opts) {
-        return write_dependency(f, opts, "x-systemd.after", "After=%1$s\n");
+        return write_dependency(f, opts,
+                                "x-systemd.after", "After=%1$s\n");
 }
 
 static int write_requires_after(FILE *f, const char *opts) {
@@ -306,6 +324,7 @@ static int add_mount(
                 *automount_name = NULL,
                 *filtered = NULL,
                 *where_escaped = NULL;
+        _cleanup_strv_free_ char **wanted_by = NULL, **required_by = NULL;
         _cleanup_fclose_ FILE *f = NULL;
         int r;
 
@@ -327,6 +346,14 @@ static int add_mount(
             mount_point_ignore(where))
                 return 0;
 
+        r = fstab_extract_values(opts, "x-systemd.wanted-by", &wanted_by);
+        if (r < 0)
+                return r;
+
+        r = fstab_extract_values(opts, "x-systemd.required-by", &required_by);
+        if (r < 0)
+                return r;
+
         if (path_equal(where, "/")) {
                 if (flags & NOAUTO)
                         log_warning("Ignoring \"noauto\" for root device");
@@ -334,7 +361,13 @@ static int add_mount(
                         log_warning("Ignoring \"nofail\" for root device");
                 if (flags & AUTOMOUNT)
                         log_warning("Ignoring automount option for root device");
+                if (!strv_isempty(wanted_by))
+                        log_warning("Ignoring \"x-systemd.wanted-by=\" for root device");
+                if (!strv_isempty(required_by))
+                        log_warning("Ignoring \"x-systemd.required-by=\" for root device");
 
+                required_by = strv_free(required_by);
+                wanted_by = strv_free(wanted_by);
                 SET_FLAG(flags, NOAUTO | NOFAIL | AUTOMOUNT, false);
         }
 
@@ -342,21 +375,15 @@ static int add_mount(
         if (r < 0)
                 return log_error_errno(r, "Failed to generate unit name: %m");
 
-        r = generator_open_unit_file(dest, "/etc/fstab", name, &f);
+        r = generator_open_unit_file(dest, fstab_path(), name, &f);
         if (r < 0)
                 return r;
 
         fprintf(f,
                 "[Unit]\n"
-                "SourcePath=%s\n"
-                "Documentation=man:fstab(5) man:systemd-fstab-generator(8)\n",
+                "Documentation=man:fstab(5) man:systemd-fstab-generator(8)\n"
+                "SourcePath=%s\n",
                 source);
-
-        /* All mounts under /sysroot need to happen later, at initrd-fs.target time. IOW, it's not
-         * technically part of the basic initrd filesystem itself, and so shouldn't inherit the default
-         * Before=local-fs.target dependency. */
-        if (in_initrd() && path_startswith(where, "/sysroot"))
-                fprintf(f, "DefaultDependencies=no\n");
 
         if (STRPTR_IN_SET(fstype, "nfs", "nfs4") && !(flags & AUTOMOUNT) &&
             fstab_test_yes_no_option(opts, "bg\0" "fg\0")) {
@@ -372,10 +399,7 @@ static int add_mount(
                 SET_FLAG(flags, NOFAIL, true);
         }
 
-        if (!(flags & NOFAIL) && !(flags & AUTOMOUNT))
-                fprintf(f, "Before=%s\n", post);
-
-        if (!(flags & AUTOMOUNT) && opts) {
+        if (opts) {
                  r = write_after(f, opts);
                  if (r < 0)
                          return r;
@@ -396,7 +420,14 @@ static int add_mount(
                         return r;
         }
 
-        fprintf(f, "\n[Mount]\n");
+        r = generator_write_blockdev_dependency(f, what);
+        if (r < 0)
+                return r;
+
+        fprintf(f,
+                "\n"
+                "[Mount]\n");
+
         if (original_where)
                 fprintf(f, "# Canonicalized from %s\n", original_where);
 
@@ -451,21 +482,35 @@ static int add_mount(
                         return r;
         }
 
-        if (!(flags & NOAUTO) && !(flags & AUTOMOUNT)) {
-                r = generator_add_symlink(dest, post,
-                                          (flags & NOFAIL) ? "wants" : "requires", name);
-                if (r < 0)
-                        return r;
-        }
+        if (!FLAGS_SET(flags, AUTOMOUNT)) {
+                if (!FLAGS_SET(flags, NOAUTO) && strv_isempty(wanted_by) && strv_isempty(required_by)) {
+                        r = generator_add_symlink(dest, post,
+                                                  (flags & NOFAIL) ? "wants" : "requires", name);
+                        if (r < 0)
+                                return r;
+                } else {
+                        char **s;
 
-        if (flags & AUTOMOUNT) {
+                        STRV_FOREACH(s, wanted_by) {
+                                r = generator_add_symlink(dest, *s, "wants", name);
+                                if (r < 0)
+                                        return r;
+                        }
+
+                        STRV_FOREACH(s, required_by) {
+                                r = generator_add_symlink(dest, *s, "requires", name);
+                                if (r < 0)
+                                        return r;
+                        }
+                }
+        } else {
                 r = unit_name_from_path(where, ".automount", &automount_name);
                 if (r < 0)
                         return log_error_errno(r, "Failed to generate unit name: %m");
 
                 f = safe_fclose(f);
 
-                r = generator_open_unit_file(dest, "/etc/fstab", automount_name, &f);
+                r = generator_open_unit_file(dest, fstab_path(), automount_name, &f);
                 if (r < 0)
                         return r;
 
@@ -474,23 +519,6 @@ static int add_mount(
                         "SourcePath=%s\n"
                         "Documentation=man:fstab(5) man:systemd-fstab-generator(8)\n",
                         source);
-
-                fprintf(f, "Before=%s\n", post);
-
-                if (opts) {
-                        r = write_after(f, opts);
-                        if (r < 0)
-                                return r;
-                        r = write_requires_after(f, opts);
-                        if (r < 0)
-                                return r;
-                        r = write_before(f, opts);
-                        if (r < 0)
-                                return r;
-                        r = write_requires_mounts_for(f, opts);
-                        if (r < 0)
-                                return r;
-                }
 
                 fprintf(f,
                         "\n"
@@ -517,19 +545,19 @@ static int add_mount(
 
 static int parse_fstab(bool initrd) {
         _cleanup_endmntent_ FILE *f = NULL;
-        const char *fstab_path;
+        const char *fstab;
         struct mntent *me;
         int r = 0;
 
-        fstab_path = initrd ? "/sysroot/etc/fstab" : "/etc/fstab";
-        log_debug("Parsing %s...", fstab_path);
+        fstab = initrd ? "/sysroot/etc/fstab" : fstab_path();
+        log_debug("Parsing %s...", fstab);
 
-        f = setmntent(fstab_path, "re");
+        f = setmntent(fstab, "re");
         if (!f) {
                 if (errno == ENOENT)
                         return 0;
 
-                return log_error_errno(errno, "Failed to open %s: %m", fstab_path);
+                return log_error_errno(errno, "Failed to open %s: %m", fstab);
         }
 
         while ((me = getmntent(f))) {
@@ -563,7 +591,7 @@ static int parse_fstab(bool initrd) {
                          * target is the final directory. */
                         r = chase_symlinks(where, initrd ? "/sysroot" : NULL,
                                            CHASE_PREFIX_ROOT | CHASE_NONEXISTENT,
-                                           &canonical_where);
+                                           &canonical_where, NULL);
                         if (r < 0) /* If we can't canonicalize we continue on as if it wasn't a symlink */
                                 log_debug_errno(r, "Failed to read symlink target for %s, ignoring: %m", where);
                         else if (streq(canonical_where, where)) /* If it was fully canonicalized, suppress the change */
@@ -608,7 +636,7 @@ static int parse_fstab(bool initrd) {
                                       me->mnt_passno,
                                       makefs*MAKEFS | growfs*GROWFS | noauto*NOAUTO | nofail*NOFAIL | automount*AUTOMOUNT,
                                       post,
-                                      fstab_path);
+                                      fstab);
                 }
 
                 if (r >= 0 && k < 0)

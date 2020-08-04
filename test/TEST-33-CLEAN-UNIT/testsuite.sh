@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # -*- mode: shell-script; indent-tabs-mode: nil; sh-basic-offset: 4; -*-
 # ex: ts=8 sw=4 sts=4 et filetype=sh
 set -ex
@@ -168,6 +168,151 @@ systemctl clean testservice --what=all
 ! test -L /var/lib/testservice
 ! test -L /var/cache/testservice
 ! test -L /var/log/testservice
+
+cat > /etc/systemd/system/tmp-hoge.mount <<EOF
+[Mount]
+What=tmpfs
+Type=tmpfs
+ConfigurationDirectory=hoge
+RuntimeDirectory=hoge
+StateDirectory=hoge
+CacheDirectory=hoge
+LogsDirectory=hoge
+EOF
+
+systemctl daemon-reload
+
+! test -e /etc/hoge
+! test -e /run/hoge
+! test -e /var/lib/hoge
+! test -e /var/cache/hoge
+! test -e /var/log/hoge
+
+systemctl start tmp-hoge.mount
+
+test -d /etc/hoge
+test -d /run/hoge
+test -d /var/lib/hoge
+test -d /var/cache/hoge
+test -d /var/log/hoge
+
+! systemctl clean tmp-hoge.mount
+
+test -d /etc/hoge
+test -d /run/hoge
+test -d /var/lib/hoge
+test -d /var/cache/hoge
+test -d /var/log/hoge
+
+systemctl stop tmp-hoge.mount
+
+test -d /etc/hoge
+! test -d /run/hoge
+test -d /var/lib/hoge
+test -d /var/cache/hoge
+test -d /var/log/hoge
+
+systemctl clean tmp-hoge.mount --what=configuration
+
+! test -d /etc/hoge
+! test -d /run/hoge
+test -d /var/lib/hoge
+test -d /var/cache/hoge
+test -d /var/log/hoge
+
+systemctl clean tmp-hoge.mount
+
+! test -d /etc/hoge
+! test -d /run/hoge
+test -d /var/lib/hoge
+! test -d /var/cache/hoge
+test -d /var/log/hoge
+
+systemctl clean tmp-hoge.mount --what=logs
+
+! test -d /etc/hoge
+! test -d /run/hoge
+test -d /var/lib/hoge
+! test -d /var/cache/hoge
+! test -d /var/log/hoge
+
+systemctl clean tmp-hoge.mount --what=all
+
+! test -d /etc/hoge
+! test -d /run/hoge
+! test -d /var/lib/hoge
+! test -d /var/cache/hoge
+! test -d /var/log/hoge
+
+cat > /etc/systemd/system/testservice.socket <<EOF
+[Socket]
+ListenSequentialPacket=/run/testservice.socket
+RemoveOnStop=yes
+ExecStartPre=true
+ConfigurationDirectory=testsocket
+RuntimeDirectory=testsocket
+StateDirectory=testsocket
+CacheDirectory=testsocket
+LogsDirectory=testsocket
+EOF
+
+systemctl daemon-reload
+
+! test -e /etc/testsocket
+! test -e /run/testsocket
+! test -e /var/lib/testsocket
+! test -e /var/cache/testsocket
+! test -e /var/log/testsocket
+
+systemctl start testservice.socket
+
+test -d /etc/testsocket
+! test -d /run/testsocket
+test -d /var/lib/testsocket
+test -d /var/cache/testsocket
+test -d /var/log/testsocket
+
+! systemctl clean testservice.socket
+
+systemctl stop testservice.socket
+
+test -d /etc/testsocket
+! test -d /run/testsocket
+test -d /var/lib/testsocket
+test -d /var/cache/testsocket
+test -d /var/log/testsocket
+
+systemctl clean testservice.socket --what=configuration
+
+! test -e /etc/testsocket
+! test -d /run/testsocket
+test -d /var/lib/testsocket
+test -d /var/cache/testsocket
+test -d /var/log/testsocket
+
+systemctl clean testservice.socket
+
+! test -e /etc/testsocket
+! test -e /run/testsocket
+test -d /var/lib/testsocket
+! test -e /var/cache/testsocket
+test -d /var/log/testsocket
+
+systemctl clean testservice.socket --what=logs
+
+! test -e /etc/testsocket
+! test -e /run/testsocket
+test -d /var/lib/testsocket
+! test -e /var/cache/testsocket
+! test -e /var/log/testsocket
+
+systemctl clean testservice.socket --what=all
+
+! test -e /etc/testsocket
+! test -e /run/testsocket
+! test -e /var/lib/testsocket
+! test -e /var/cache/testsocket
+! test -e /var/log/testsocket
 
 echo OK > /testok
 

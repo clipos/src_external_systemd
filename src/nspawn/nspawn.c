@@ -1,22 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
 #if HAVE_BLKID
-#include <blkid.h>
 #endif
 #include <errno.h>
 #include <getopt.h>
-#include <grp.h>
 #include <linux/fs.h>
 #include <linux/loop.h>
-#include <pwd.h>
-#include <sched.h>
 #if HAVE_SELINUX
 #include <selinux/selinux.h>
 #endif
-#include <signal.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/file.h>
 #include <sys/personality.h>
 #include <sys/prctl.h>
@@ -58,7 +51,7 @@
 #include "machine-image.h"
 #include "macro.h"
 #include "main-func.h"
-#include "missing.h"
+#include "missing_sched.h"
 #include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
@@ -297,7 +290,7 @@ static int help(void) {
                 return log_oom();
 
         printf("%1$s [OPTIONS...] [PATH] [ARGUMENTS...]\n\n"
-               "Spawn a command or OS in a light-weight container.\n\n"
+               "%5$sSpawn a command or OS in a light-weight container.%6$s\n\n"
                "  -h --help                 Show this help\n"
                "     --version              Print version string\n"
                "  -q --quiet                Do not show status information\n"
@@ -412,7 +405,9 @@ static int help(void) {
                "\nSee the %2$s for details.\n"
                , program_invocation_short_name
                , link
-               , ansi_underline(), ansi_normal());
+               , ansi_underline(), ansi_normal()
+               , ansi_highlight(), ansi_normal()
+        );
 
         return 0;
 }
@@ -437,15 +432,22 @@ static int custom_mount_check_all(void) {
 }
 
 static int detect_unified_cgroup_hierarchy_from_environment(void) {
-        const char *e;
+        const char *e, *var = "SYSTEMD_NSPAWN_UNIFIED_HIERARCHY";
         int r;
 
         /* Allow the user to control whether the unified hierarchy is used */
-        e = getenv("UNIFIED_CGROUP_HIERARCHY");
-        if (e) {
+
+        e = getenv(var);
+        if (!e) {
+                /* $UNIFIED_CGROUP_HIERARCHY has been renamed to $SYSTEMD_NSPAWN_UNIFIED_HIERARCHY. */
+                var = "UNIFIED_CGROUP_HIERARCHY";
+                e = getenv(var);
+        }
+
+        if (!isempty(e)) {
                 r = parse_boolean(e);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to parse $UNIFIED_CGROUP_HIERARCHY.");
+                        return log_error_errno(r, "Failed to parse $%s: %m", var);
                 if (r > 0)
                         arg_unified_cgroup_hierarchy = CGROUP_UNIFIED_ALL;
                 else
@@ -490,6 +492,46 @@ static int detect_unified_cgroup_hierarchy_from_image(const char *directory) {
                   arg_unified_cgroup_hierarchy == CGROUP_UNIFIED_SYSTEMD ? "hybrid" : "unified");
 
         return 0;
+}
+
+static int parse_capability_spec(const char *spec, uint64_t *ret_mask) {
+        uint64_t mask = 0;
+        int r;
+
+        for (;;) {
+                _cleanup_free_ char *t = NULL;
+
+                r = extract_first_word(&spec, &t, ",", 0);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse capability %s.", t);
+                if (r == 0)
+                        break;
+
+                if (streq(t, "help")) {
+                        for (int i = 0; i < capability_list_length(); i++) {
+                                const char *name;
+
+                                name = capability_to_name(i);
+                                if (name)
+                                        puts(name);
+                        }
+
+                        return 0; /* quit */
+                }
+
+                if (streq(t, "all"))
+                        mask = (uint64_t) -1;
+                else {
+                        r = capability_from_name(t);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse capability %s.", t);
+
+                        mask |= 1ULL << r;
+                }
+        }
+
+        *ret_mask = mask;
+        return 1; /* continue */
 }
 
 static int parse_share_ns_env(const char *name, unsigned long ns_flag) {
@@ -695,7 +737,6 @@ static int parse_argv(int argc, char *argv[]) {
         };
 
         int c, r;
-        const char *p;
         uint64_t plus = 0, minus = 0;
         bool mask_all_settings = false, mask_no_settings = false;
 
@@ -807,6 +848,10 @@ static int parse_argv(int argc, char *argv[]) {
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Network interface name not valid: %s", optarg);
 
+                        r = test_network_interface_initialized(optarg);
+                        if (r < 0)
+                                return r;
+
                         if (strv_extend(&arg_network_interfaces, optarg) < 0)
                                 return log_oom();
 
@@ -820,6 +865,10 @@ static int parse_argv(int argc, char *argv[]) {
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "MACVLAN network interface name not valid: %s", optarg);
 
+                        r = test_network_interface_initialized(optarg);
+                        if (r < 0)
+                                return r;
+
                         if (strv_extend(&arg_network_macvlan, optarg) < 0)
                                 return log_oom();
 
@@ -832,6 +881,10 @@ static int parse_argv(int argc, char *argv[]) {
                         if (!ifname_valid(optarg))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "IPVLAN network interface name not valid: %s", optarg);
+
+                        r = test_network_interface_initialized(optarg);
+                        if (r < 0)
+                                return r;
 
                         if (strv_extend(&arg_network_ipvlan, optarg) < 0)
                                 return log_oom();
@@ -883,7 +936,7 @@ static int parse_argv(int argc, char *argv[]) {
                 case 'S': {
                         _cleanup_free_ char *mangled = NULL;
 
-                        r = unit_name_mangle_with_suffix(optarg, UNIT_NAME_MANGLE_WARN, ".slice", &mangled);
+                        r = unit_name_mangle_with_suffix(optarg, NULL, UNIT_NAME_MANGLE_WARN, ".slice", &mangled);
                         if (r < 0)
                                 return log_oom();
 
@@ -937,37 +990,18 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_CAPABILITY:
                 case ARG_DROP_CAPABILITY: {
-                        p = optarg;
-                        for (;;) {
-                                _cleanup_free_ char *t = NULL;
+                        uint64_t m;
+                        r = parse_capability_spec(optarg, &m);
+                        if (r <= 0)
+                                return r;
 
-                                r = extract_first_word(&p, &t, ",", 0);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to parse capability %s.", t);
-                                if (r == 0)
-                                        break;
-
-                                if (streq(t, "all")) {
-                                        if (c == ARG_CAPABILITY)
-                                                plus = (uint64_t) -1;
-                                        else
-                                                minus = (uint64_t) -1;
-                                } else {
-                                        r = capability_from_name(t);
-                                        if (r < 0)
-                                                return log_error_errno(r, "Failed to parse capability %s.", t);
-
-                                        if (c == ARG_CAPABILITY)
-                                                plus |= 1ULL << r;
-                                        else
-                                                minus |= 1ULL << r;
-                                }
-                        }
-
+                        if (c == ARG_CAPABILITY)
+                                plus |= m;
+                        else
+                                minus |= m;
                         arg_settings_mask |= SETTING_CAPABILITY;
                         break;
                 }
-
                 case ARG_NO_NEW_PRIVILEGES:
                         r = parse_boolean(optarg);
                         if (r < 0)
@@ -1507,6 +1541,9 @@ static int verify_arguments(void) {
         if (arg_volatile_mode != VOLATILE_NO) /* Make sure all file systems contained in the image are mounted read-only if we are in volatile mode */
                 arg_read_only = true;
 
+        if (has_custom_root_mount(arg_custom_mounts, arg_n_custom_mounts))
+                arg_read_only = true;
+
         if (arg_keep_unit && arg_register && cg_pid_get_owner_uid(0, NULL) >= 0)
                 /* Save the user from accidentally registering either user-$SESSION.scope or user@.service.
                  * The latter is not technically a user session, but we don't need to labour the point. */
@@ -1540,13 +1577,13 @@ static int verify_arguments(void) {
         if (arg_userns_chown && arg_volatile_mode != VOLATILE_NO)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--volatile= and --private-users-chown may not be combined.");
 
-        /* If --network-namespace-path is given with any other network-related option, we need to error out,
-         * to avoid conflicts between different network options. */
+        /* If --network-namespace-path is given with any other network-related option (except --private-network),
+         * we need to error out, to avoid conflicts between different network options. */
         if (arg_network_namespace_path &&
                 (arg_network_interfaces || arg_network_macvlan ||
                  arg_network_ipvlan || arg_network_veth_extra ||
                  arg_network_bridge || arg_network_zone ||
-                 arg_network_veth || arg_private_network))
+                 arg_network_veth))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--network-namespace-path= cannot be combined with other network options.");
 
         if (arg_network_bridge && arg_network_zone)
@@ -1661,7 +1698,7 @@ static int setup_timezone(const char *dest) {
         if (m == TIMEZONE_OFF)
                 return 0;
 
-        r = chase_symlinks("/etc", dest, CHASE_PREFIX_ROOT, &etc);
+        r = chase_symlinks("/etc", dest, CHASE_PREFIX_ROOT, &etc, NULL);
         if (r < 0) {
                 log_warning_errno(r, "Failed to resolve /etc path in container, ignoring: %m");
                 return 0;
@@ -1692,7 +1729,7 @@ static int setup_timezone(const char *dest) {
                         return 0; /* Already pointing to the right place? Then do nothing .. */
 
                 check = strjoina(dest, "/usr/share/zoneinfo/", z);
-                r = chase_symlinks(check, dest, 0, NULL);
+                r = chase_symlinks(check, dest, 0, NULL, NULL);
                 if (r < 0)
                         log_debug_errno(r, "Timezone %s does not exist (or is not accessible) in container, not creating symlink: %m", z);
                 else {
@@ -1719,7 +1756,7 @@ static int setup_timezone(const char *dest) {
                 _cleanup_free_ char *resolved = NULL;
                 int found;
 
-                found = chase_symlinks(where, dest, CHASE_NONEXISTENT, &resolved);
+                found = chase_symlinks(where, dest, CHASE_NONEXISTENT, &resolved, NULL);
                 if (found < 0) {
                         log_warning_errno(found, "Failed to resolve /etc/localtime path in container, ignoring: %m");
                         return 0;
@@ -1825,7 +1862,7 @@ static int setup_resolv_conf(const char *dest) {
         if (m == RESOLV_CONF_OFF)
                 return 0;
 
-        r = chase_symlinks("/etc", dest, CHASE_PREFIX_ROOT, &etc);
+        r = chase_symlinks("/etc", dest, CHASE_PREFIX_ROOT, &etc, NULL);
         if (r < 0) {
                 log_warning_errno(r, "Failed to resolve /etc path in container, ignoring: %m");
                 return 0;
@@ -1849,7 +1886,7 @@ static int setup_resolv_conf(const char *dest) {
                 _cleanup_free_ char *resolved = NULL;
                 int found;
 
-                found = chase_symlinks(where, dest, CHASE_NONEXISTENT, &resolved);
+                found = chase_symlinks(where, dest, CHASE_NONEXISTENT, &resolved, NULL);
                 if (found < 0) {
                         log_warning_errno(found, "Failed to resolve /etc/resolv.conf path in container, ignoring: %m");
                         return 0;
@@ -2207,9 +2244,9 @@ static int setup_hostname(void) {
 
 static int setup_journal(const char *directory) {
         _cleanup_free_ char *d = NULL;
+        char id[SD_ID128_STRING_MAX];
         const char *dirname, *p, *q;
         sd_id128_t this_id;
-        char id[33];
         bool try;
         int r;
 
@@ -2727,12 +2764,11 @@ static int chase_symlinks_and_update(char **p, unsigned flags) {
         if (!*p)
                 return 0;
 
-        r = chase_symlinks(*p, NULL, flags, &chased);
+        r = chase_symlinks(*p, NULL, flags, &chased, NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to resolve path %s: %m", *p);
 
-        free_and_replace(*p, chased);
-        return r; /* r might be an fd here in case we ever use CHASE_OPEN in flags */
+        return free_and_replace(*p, chased);
 }
 
 static int determine_uid_shift(const char *directory) {
@@ -2845,7 +2881,7 @@ static int inner_child(
                 FDSet *fds) {
 
         _cleanup_free_ char *home = NULL;
-        char as_uuid[37];
+        char as_uuid[ID128_UUID_STRING_MAX];
         size_t n_env = 1;
         const char *envp[] = {
                 "PATH=" DEFAULT_PATH_COMPAT,
@@ -2887,13 +2923,20 @@ static int inner_child(
 
                 /* Wait until the parent wrote the UID map */
                 if (!barrier_place_and_sync(barrier)) /* #2 */
-                        return log_error_errno(SYNTHETIC_ERRNO(ESRCH),
-                                               "Parent died too early");
-        }
+                        return log_error_errno(SYNTHETIC_ERRNO(ESRCH), "Parent died too early");
 
-        r = reset_uid_gid();
-        if (r < 0)
-                return log_error_errno(r, "Couldn't become new root: %m");
+                /* Become the new root user inside our namespace */
+                r = reset_uid_gid();
+                if (r < 0)
+                        return log_error_errno(r, "Couldn't become new root: %m");
+
+                /* Creating a new user namespace means all MS_SHARED mounts become MS_SLAVE. Let's put them
+                 * back to MS_SHARED here, since that's what we want as defaults. (This will not reconnect
+                 * propagation, but simply create new peer groups for all our mounts). */
+                r = mount_verbose(LOG_ERR, NULL, "/", NULL, MS_SHARED|MS_REC, NULL);
+                if (r < 0)
+                        return r;
+        }
 
         r = mount_all(NULL,
                       arg_mount_settings | MOUNT_IN_USERNS,
@@ -2954,11 +2997,9 @@ static int inner_child(
                         "/",
                         arg_custom_mounts,
                         arg_n_custom_mounts,
-                        false,
-                        0,
                         0,
                         arg_selinux_apifs_context,
-                        true);
+                        MOUNT_NON_ROOT_ONLY | MOUNT_IN_USERNS);
         if (r < 0)
                 return r;
 
@@ -2966,7 +3007,7 @@ static int inner_child(
                 return log_error_errno(errno, "setsid() failed: %m");
 
         if (arg_private_network)
-                loopback_setup();
+                (void) loopback_setup();
 
         if (arg_expose_ports) {
                 r = expose_port_send_rtnl(rtnl_socket);
@@ -2986,7 +3027,7 @@ static int inner_child(
 
                 r = setup_dev_console(console);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to setup /dev/console: %m");
+                        return log_error_errno(r, "Failed to set up /dev/console: %m");
 
                 r = send_one_fd(master_pty_socket, master, 0);
                 if (r < 0)
@@ -3233,6 +3274,7 @@ static int outer_child(
                 int netns_fd) {
 
         _cleanup_close_ int fd = -1;
+        const char *p;
         pid_t pid;
         ssize_t l;
         int r;
@@ -3259,9 +3301,8 @@ static int outer_child(
         if (r < 0)
                 return r;
 
-        /* Mark everything as slave, so that we still
-         * receive mounts from the real root, but don't
-         * propagate mounts to the real root. */
+        /* Mark everything as slave, so that we still receive mounts from the real root, but don't propagate
+         * mounts to the real root. */
         r = mount_verbose(LOG_ERR, NULL, "/", NULL, MS_SLAVE|MS_REC, NULL);
         if (r < 0)
                 return r;
@@ -3274,10 +3315,12 @@ static int outer_child(
 
                 r = dissected_image_mount(dissected_image, directory, arg_uid_shift,
                                           DISSECT_IMAGE_MOUNT_ROOT_ONLY|DISSECT_IMAGE_DISCARD_ON_LOOP|
-                                          (arg_read_only ? DISSECT_IMAGE_READ_ONLY : 0)|
+                                          (arg_read_only ? DISSECT_IMAGE_READ_ONLY : DISSECT_IMAGE_FSCK)|
                                           (arg_start_mode == START_BOOT ? DISSECT_IMAGE_VALIDATE_OS : 0));
+                if (r == -EUCLEAN)
+                        return log_error_errno(r, "File system check for image failed: %m");
                 if (r < 0)
-                        return r;
+                        return log_error_errno(r, "Failed to mount image root file system: %m");
         }
 
         r = determine_uid_shift(directory);
@@ -3324,13 +3367,6 @@ static int outer_child(
                         return r;
 
                 directory = "/run/systemd/nspawn-root";
-
-        } else if (!dissected_image) {
-                /* Turn directory into bind mount (we need that so that we can move the bind mount to root
-                 * later on). */
-                r = mount_verbose(LOG_ERR, directory, directory, NULL, MS_BIND|MS_REC, NULL);
-                if (r < 0)
-                        return r;
         }
 
         r = setup_pivot_root(
@@ -3343,19 +3379,36 @@ static int outer_child(
         r = setup_volatile_mode(
                         directory,
                         arg_volatile_mode,
-                        arg_userns_mode != USER_NAMESPACE_NO,
                         arg_uid_shift,
-                        arg_uid_range,
                         arg_selinux_apifs_context);
         if (r < 0)
                 return r;
 
+        r = mount_custom(
+                        directory,
+                        arg_custom_mounts,
+                        arg_n_custom_mounts,
+                        arg_uid_shift,
+                        arg_selinux_apifs_context,
+                        MOUNT_ROOT_ONLY);
+        if (r < 0)
+                return r;
+
+        /* Make sure we always have a mount that we can move to root later on. */
+        if (!path_is_mount_point(directory, NULL, 0)) {
+                r = mount_verbose(LOG_ERR, directory, directory, NULL, MS_BIND|MS_REC, NULL);
+                if (r < 0)
+                        return r;
+        }
+
         if (dissected_image) {
                 /* Now we know the uid shift, let's now mount everything else that might be in the image. */
                 r = dissected_image_mount(dissected_image, directory, arg_uid_shift,
-                                          DISSECT_IMAGE_MOUNT_NON_ROOT_ONLY|DISSECT_IMAGE_DISCARD_ON_LOOP|(arg_read_only ? DISSECT_IMAGE_READ_ONLY : 0));
+                                          DISSECT_IMAGE_MOUNT_NON_ROOT_ONLY|DISSECT_IMAGE_DISCARD_ON_LOOP|(arg_read_only ? DISSECT_IMAGE_READ_ONLY : DISSECT_IMAGE_FSCK));
+                if (r == -EUCLEAN)
+                        return log_error_errno(r, "File system check for image failed: %m");
                 if (r < 0)
-                        return r;
+                        return log_error_errno(r, "Failed to mount image file system: %m");
         }
 
         if (arg_unified_cgroup_hierarchy == CGROUP_UNIFIED_UNKNOWN) {
@@ -3380,7 +3433,12 @@ static int outer_child(
          * inside the container that create a new mount namespace.
          * See https://github.com/systemd/systemd/issues/3860
          * Further submounts (such as /dev) done after this will inherit the
-         * shared propagation mode. */
+         * shared propagation mode.
+         *
+         * IMPORTANT: Do not overmount the root directory anymore from now on to
+         * enable moving the root directory mount to root later on.
+         * https://github.com/systemd/systemd/issues/3847#issuecomment-562735251
+         */
         r = mount_verbose(LOG_ERR, NULL, directory, NULL, MS_SHARED|MS_REC, NULL);
         if (r < 0)
                 return r;
@@ -3393,7 +3451,8 @@ static int outer_child(
         if (r < 0)
                 return r;
 
-        if (arg_read_only && arg_volatile_mode == VOLATILE_NO) {
+        if (arg_read_only && arg_volatile_mode == VOLATILE_NO &&
+                !has_custom_root_mount(arg_custom_mounts, arg_n_custom_mounts)) {
                 r = bind_remount_recursive(directory, MS_RDONLY, MS_RDONLY, NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to make tree read-only: %m");
@@ -3415,7 +3474,9 @@ static int outer_child(
                 return r;
 
         (void) dev_setup(directory, arg_uid_shift, arg_uid_shift);
-        (void) make_inaccessible_nodes(directory, arg_uid_shift, arg_uid_shift);
+
+        p = prefix_roota(directory, "/run/systemd");
+        (void) make_inaccessible_nodes(p, arg_uid_shift, arg_uid_shift);
 
         r = setup_pts(directory);
         if (r < 0)
@@ -3426,6 +3487,16 @@ static int outer_child(
                 return r;
 
         r = setup_keyring();
+        if (r < 0)
+                return r;
+
+        r = mount_custom(
+                        directory,
+                        arg_custom_mounts,
+                        arg_n_custom_mounts,
+                        arg_uid_shift,
+                        arg_selinux_apifs_context,
+                        MOUNT_NON_ROOT_ONLY);
         if (r < 0)
                 return r;
 
@@ -3442,18 +3513,6 @@ static int outer_child(
                 return r;
 
         r = setup_journal(directory);
-        if (r < 0)
-                return r;
-
-        r = mount_custom(
-                        directory,
-                        arg_custom_mounts,
-                        arg_n_custom_mounts,
-                        arg_userns_mode != USER_NAMESPACE_NO,
-                        arg_uid_shift,
-                        arg_uid_range,
-                        arg_selinux_apifs_context,
-                        false);
         if (r < 0)
                 return r;
 
@@ -3489,9 +3548,8 @@ static int outer_child(
                 notify_socket = safe_close(notify_socket);
                 uid_shift_socket = safe_close(uid_shift_socket);
 
-                /* The inner child has all namespaces that are
-                 * requested, so that we all are owned by the user if
-                 * user namespaces are turned on. */
+                /* The inner child has all namespaces that are requested, so that we all are owned by the
+                 * user if user namespaces are turned on. */
 
                 if (arg_network_namespace_path) {
                         r = namespace_enter(-1, -1, netns_fd, -1, -1);
@@ -3658,13 +3716,12 @@ static int nspawn_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t r
                 return 0;
         }
 
-        n = recvmsg(fd, &msghdr, MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
-        if (n < 0) {
-                if (IN_SET(errno, EAGAIN, EINTR))
-                        return 0;
+        n = recvmsg_safe(fd, &msghdr, MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
+        if (IN_SET(n, -EAGAIN, -EINTR))
+                return 0;
+        if (n < 0)
+                return log_warning_errno(n, "Couldn't read notification socket: %m");
 
-                return log_warning_errno(errno, "Couldn't read notification socket: %m");
-        }
         cmsg_close_all(&msghdr);
 
         CMSG_FOREACH(cmsg, &msghdr) {
@@ -3771,6 +3828,7 @@ static int merge_settings(Settings *settings, const char *path) {
 
         if ((arg_settings_mask & SETTING_CAPABILITY) == 0) {
                 uint64_t plus, minus;
+                uint64_t network_minus = 0;
 
                 /* Note that we copy both the simple plus/minus caps here, and the full quintet from the
                  * Settings structure */
@@ -3782,14 +3840,16 @@ static int merge_settings(Settings *settings, const char *path) {
                         if (settings_private_network(settings))
                                 plus |= UINT64_C(1) << CAP_NET_ADMIN;
                         else
-                                minus |= UINT64_C(1) << CAP_NET_ADMIN;
+                                network_minus |= UINT64_C(1) << CAP_NET_ADMIN;
                 }
 
                 if (!arg_settings_trusted && plus != 0) {
                         if (settings->capability != 0)
                                 log_warning("Ignoring Capability= setting, file %s is not trusted.", path);
-                } else
+                } else {
+                        arg_caps_retain &= ~network_minus;
                         arg_caps_retain |= plus;
+                }
 
                 arg_caps_retain &= ~minus;
 
@@ -4163,7 +4223,7 @@ static int run_container(
         int ifi = 0, r;
         ssize_t l;
         sigset_t mask_chld;
-        _cleanup_close_ int netns_fd = -1;
+        _cleanup_close_ int child_netns_fd = -1;
 
         assert_se(sigemptyset(&mask_chld) == 0);
         assert_se(sigaddset(&mask_chld, SIGCHLD) == 0);
@@ -4222,11 +4282,11 @@ static int run_container(
                 return log_error_errno(errno, "Failed to install SIGCHLD handler: %m");
 
         if (arg_network_namespace_path) {
-                netns_fd = open(arg_network_namespace_path, O_RDONLY|O_NOCTTY|O_CLOEXEC);
-                if (netns_fd < 0)
+                child_netns_fd = open(arg_network_namespace_path, O_RDONLY|O_NOCTTY|O_CLOEXEC);
+                if (child_netns_fd < 0)
                         return log_error_errno(errno, "Cannot open file %s: %m", arg_network_namespace_path);
 
-                r = fd_is_network_ns(netns_fd);
+                r = fd_is_network_ns(child_netns_fd);
                 if (r == -EUCLEAN)
                         log_debug_errno(r, "Cannot determine if passed network namespace path '%s' really refers to a network namespace, assuming it does.", arg_network_namespace_path);
                 else if (r < 0)
@@ -4271,7 +4331,7 @@ static int run_container(
                                 master_pty_socket_pair[1],
                                 unified_cgroup_hierarchy_socket_pair[1],
                                 fds,
-                                netns_fd);
+                                child_netns_fd);
                 if (r < 0)
                         _exit(EXIT_FAILURE);
 
@@ -4373,7 +4433,15 @@ static int run_container(
                                 return log_error_errno(SYNTHETIC_ERRNO(ESRCH), "Child died too early");
                 }
 
-                r = move_network_interfaces(*pid, arg_network_interfaces);
+                if (child_netns_fd < 0) {
+                        /* Make sure we have an open file descriptor to the child's network
+                         * namespace so it stays alive even if the child exits. */
+                        r = namespace_open(*pid, NULL, NULL, &child_netns_fd, NULL, NULL);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to open child network namespace: %m");
+                }
+
+                r = move_network_interfaces(child_netns_fd, arg_network_interfaces);
                 if (r < 0)
                         return r;
 
@@ -4613,18 +4681,48 @@ static int run_container(
         }
 
         /* Kill if it is not dead yet anyway */
-        if (bus) {
-                if (arg_register)
-                        terminate_machine(bus, arg_machine);
-                else if (!arg_keep_unit)
-                        terminate_scope(bus, arg_machine);
-        }
+        if (!arg_register && !arg_keep_unit && bus)
+                terminate_scope(bus, arg_machine);
 
         /* Normally redundant, but better safe than sorry */
         (void) kill(*pid, SIGKILL);
 
+        if (arg_private_network) {
+                /* Move network interfaces back to the parent network namespace. We use `safe_fork`
+                 * to avoid having to move the parent to the child network namespace. */
+                r = safe_fork(NULL, FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_WAIT|FORK_LOG, NULL);
+                if (r < 0)
+                        return r;
+
+                if (r == 0) {
+                        _cleanup_close_ int parent_netns_fd = -1;
+
+                        r = namespace_open(getpid(), NULL, NULL, &parent_netns_fd, NULL, NULL);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to open parent network namespace: %m");
+                                _exit(EXIT_FAILURE);
+                        }
+
+                        r = namespace_enter(-1, -1, child_netns_fd, -1, -1);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to enter child network namespace: %m");
+                                _exit(EXIT_FAILURE);
+                        }
+
+                        r = move_network_interfaces(parent_netns_fd, arg_network_interfaces);
+                        if (r < 0)
+                                log_error_errno(r, "Failed to move network interfaces back to parent network namespace: %m");
+
+                        _exit(r < 0 ? EXIT_FAILURE : EXIT_SUCCESS);
+                }
+        }
+
         r = wait_for_container(*pid, &container_status);
         *pid = 0;
+
+        /* Tell machined that we are gone. */
+        if (bus)
+                (void) unregister_machine(bus, arg_machine);
 
         if (r < 0)
                 /* We failed to wait for the container, or the container exited abnormally. */
@@ -4766,7 +4864,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 goto finish;
 
-        r = cg_unified_flush();
+        r = cg_unified();
         if (r < 0) {
                 log_error_errno(r, "Failed to determine whether the unified cgroups hierarchy is used: %m");
                 goto finish;
@@ -5012,7 +5110,7 @@ static int run(int argc, char *argv[]) {
                         goto finish;
                 }
 
-                r = loop_device_make_by_path(arg_image, arg_read_only ? O_RDONLY : O_RDWR, &loop);
+                r = loop_device_make_by_path(arg_image, arg_read_only ? O_RDONLY : O_RDWR, LO_FLAGS_PARTSCAN, &loop);
                 if (r < 0) {
                         log_error_errno(r, "Failed to set up loopback block device: %m");
                         goto finish;
@@ -5022,14 +5120,14 @@ static int run(int argc, char *argv[]) {
                                 loop->fd,
                                 arg_image,
                                 arg_root_hash, arg_root_hash_size,
-                                DISSECT_IMAGE_REQUIRE_ROOT,
+                                DISSECT_IMAGE_REQUIRE_ROOT|DISSECT_IMAGE_RELAX_VAR_CHECK,
                                 &dissected_image);
                 if (r == -ENOPKG) {
                         /* dissected_image_and_warn() already printed a brief error message. Extend on that with more details */
                         log_notice("Note that the disk image needs to\n"
                                    "    a) either contain only a single MBR partition of type 0x83 that is marked bootable\n"
                                    "    b) or contain a single GPT partition of type 0FC63DAF-8483-4772-8E79-3D69D8477DE4\n"
-                                   "    c) or follow http://www.freedesktop.org/wiki/Specifications/DiscoverablePartitionsSpec/\n"
+                                   "    c) or follow https://systemd.io/DISCOVERABLE_PARTITIONS\n"
                                    "    d) or contain a file system without a partition table\n"
                                    "in order to be bootable with systemd-nspawn.");
                         goto finish;

@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
@@ -8,8 +7,6 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
@@ -108,7 +105,6 @@ DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(unit_file_type, UnitFileType);
 
 static int in_search_path(const LookupPaths *p, const char *path) {
         _cleanup_free_ char *parent = NULL;
-        char **i;
 
         assert(path);
 
@@ -116,11 +112,7 @@ static int in_search_path(const LookupPaths *p, const char *path) {
         if (!parent)
                 return -ENOMEM;
 
-        STRV_FOREACH(i, p->search_path)
-                if (path_equal(parent, *i))
-                        return true;
-
-        return false;
+        return path_strv_contains(p->search_path, parent);
 }
 
 static const char* skip_root(const LookupPaths *p, const char *path) {
@@ -240,7 +232,7 @@ static int path_is_runtime(const LookupPaths *p, const char *path, bool check_pa
                path_equal_ptr(path, p->runtime_control);
 }
 
-static int path_is_vendor(const LookupPaths *p, const char *path) {
+static int path_is_vendor_or_generator(const LookupPaths *p, const char *path) {
         const char *rpath;
 
         assert(p);
@@ -257,6 +249,9 @@ static int path_is_vendor(const LookupPaths *p, const char *path) {
         if (path_startswith(rpath, "/lib"))
                 return true;
 #endif
+
+        if (path_is_generator(p, rpath))
+                return true;
 
         return path_equal(rpath, SYSTEM_DATA_UNIT_PATH);
 }
@@ -362,6 +357,12 @@ void unit_file_dump_changes(int r, const char *verb, const UnitFileChange *chang
                         break;
                 case -EADDRNOTAVAIL:
                         log_error_errno(changes[i].type, "Failed to %s unit, unit %s is transient or generated.",
+                                        verb, changes[i].path);
+                        logged = true;
+                        break;
+                case -EUCLEAN:
+                        log_error_errno(changes[i].type,
+                                        "Failed to %s unit, \"%s\" is not a valid unit name.",
                                         verb, changes[i].path);
                         logged = true;
                         break;
@@ -582,7 +583,7 @@ static int remove_marked_symlinks_fd(
                                 return -ENOMEM;
                         path_simplify(p, false);
 
-                        q = readlink_malloc(p, &dest);
+                        q = chase_symlinks(p, NULL, CHASE_NONEXISTENT, &dest, NULL);
                         if (q == -ENOENT)
                                 continue;
                         if (q < 0) {
@@ -1020,10 +1021,14 @@ static int install_info_add(
         int r;
 
         assert(c);
-        assert(name || path);
 
-        if (!name)
+        if (!name) {
+                /* 'name' and 'path' must not both be null. Check here 'path' using assert_se() to
+                 * workaround a bug in gcc that generates a -Wnonnull warning when calling basename(),
+                 * but this cannot be possible in any code path (See #6119). */
+                assert_se(path);
                 name = basename(path);
+        }
 
         if (!unit_name_is_valid(name, UNIT_NAME_ANY))
                 return -EINVAL;
@@ -1119,7 +1124,7 @@ static int config_parse_also(
                 void *data,
                 void *userdata) {
 
-        UnitFileInstallInfo *info = userdata, *alsoinfo = NULL;
+        UnitFileInstallInfo *info = userdata;
         InstallContext *c = data;
         int r;
 
@@ -1141,10 +1146,7 @@ static int config_parse_also(
                 if (r < 0)
                         return r;
 
-                if (!unit_name_is_valid(printed, UNIT_NAME_ANY))
-                        return -EINVAL;
-
-                r = install_info_add(c, printed, NULL, true, &alsoinfo);
+                r = install_info_add(c, printed, NULL, true, NULL);
                 if (r < 0)
                         return r;
 
@@ -1197,7 +1199,8 @@ static int config_parse_default_instance(
         }
 
         if (!unit_instance_is_valid(printed))
-                return -EINVAL;
+                return log_syntax(unit, LOG_WARNING, filename, line, SYNTHETIC_ERRNO(EINVAL),
+                                  "Invalid DefaultInstance= value \"%s\".", printed);
 
         return free_and_replace(i->default_instance, printed);
 }
@@ -1235,7 +1238,7 @@ static int unit_file_load(
                         return -EINVAL;
                 if (unit_name_is_valid(info->name, UNIT_NAME_TEMPLATE|UNIT_NAME_INSTANCE) && !unit_type_may_template(type))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "Unit type %s cannot be templated.", unit_type_to_string(type));
+                                               "%s: unit type %s cannot be templated, ignoring.", path, unit_type_to_string(type));
 
                 if (!(flags & SEARCH_LOAD)) {
                         r = lstat(path, &st);
@@ -1293,9 +1296,21 @@ static int unit_file_load(
         assert(c);
 
         r = config_parse(info->name, path, f,
-                         NULL,
+                         "Install\0"
+                         "-Unit\0"
+                         "-Automount\0"
+                         "-Device\0"
+                         "-Mount\0"
+                         "-Path\0"
+                         "-Scope\0"
+                         "-Service\0"
+                         "-Slice\0"
+                         "-Socket\0"
+                         "-Swap\0"
+                         "-Target\0"
+                         "-Timer\0",
                          config_item_table_lookup, items,
-                         CONFIG_PARSE_RELAXED|CONFIG_PARSE_ALLOW_INCLUDE, info);
+                         CONFIG_PARSE_ALLOW_INCLUDE, info);
         if (r < 0)
                 return log_debug_errno(r, "Failed to parse %s: %m", info->name);
 
@@ -1695,6 +1710,82 @@ static int install_info_discover_and_check(
         return install_info_may_process(ret ? *ret : NULL, paths, changes, n_changes);
 }
 
+int unit_file_verify_alias(const UnitFileInstallInfo *i, const char *dst, char **ret_dst) {
+        _cleanup_free_ char *dst_updated = NULL;
+        int r;
+
+        /* Verify that dst is a valid either a valid alias or a valid .wants/.requires symlink for the target
+         * unit *i. Return negative on error or if not compatible, zero on success.
+         *
+         * ret_dst is set in cases where "instance propagation" happens, i.e. when the instance part is
+         * inserted into dst. It is not normally set, even on success, so that the caller can easily
+         * distinguish the case where instance propagation occured.
+         */
+
+        const char *path_alias = strrchr(dst, '/');
+        if (path_alias) {
+                /* This branch covers legacy Alias= function of creating .wants and .requires symlinks. */
+                _cleanup_free_ char *dir = NULL;
+                char *p;
+
+                path_alias ++; /* skip over slash */
+
+                dir = dirname_malloc(dst);
+                if (!dir)
+                        return log_oom();
+
+                p = endswith(dir, ".wants");
+                if (!p)
+                        p = endswith(dir, ".requires");
+                if (!p)
+                        return log_warning_errno(SYNTHETIC_ERRNO(EXDEV),
+                                                 "Invalid path \"%s\" in alias.", dir);
+                *p = '\0'; /* dir should now be a unit name */
+
+                r = unit_name_classify(dir);
+                if (r < 0)
+                        return log_warning_errno(SYNTHETIC_ERRNO(EXDEV),
+                                                 "Invalid unit name component \"%s\" in alias.", dir);
+
+                const bool instance_propagation = r == UNIT_NAME_TEMPLATE;
+
+                /* That's the name we want to use for verification. */
+                r = unit_symlink_name_compatible(path_alias, i->name, instance_propagation);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to verify alias validity: %m");
+                if (r == 0)
+                        return log_warning_errno(SYNTHETIC_ERRNO(EXDEV),
+                                                 "Invalid unit %s symlink %s.",
+                                                 i->name, dst);
+
+        } else {
+                /* If the symlink target has an instance set and the symlink source doesn't, we "propagate
+                 * the instance", i.e. instantiate the symlink source with the target instance. */
+                if (unit_name_is_valid(dst, UNIT_NAME_TEMPLATE)) {
+                        _cleanup_free_ char *inst = NULL;
+
+                        r = unit_name_to_instance(i->name, &inst);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to extract instance name from %s: %m", i->name);
+
+                        if (r == UNIT_NAME_INSTANCE) {
+                                r = unit_name_replace_instance(dst, inst, &dst_updated);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to build unit name from %s+%s: %m",
+                                                               dst, inst);
+                        }
+                }
+
+                r = unit_validate_alias_symlink_and_warn(dst_updated ?: dst, i->name);
+                if (r < 0)
+                        return r;
+
+        }
+
+        *ret_dst = TAKE_PTR(dst_updated);
+        return 0;
+}
+
 static int install_info_symlink_alias(
                 UnitFileInstallInfo *i,
                 const LookupPaths *paths,
@@ -1711,13 +1802,17 @@ static int install_info_symlink_alias(
         assert(config_path);
 
         STRV_FOREACH(s, i->aliases) {
-                _cleanup_free_ char *alias_path = NULL, *dst = NULL;
+                _cleanup_free_ char *alias_path = NULL, *dst = NULL, *dst_updated = NULL;
 
                 q = install_full_printf(i, *s, &dst);
                 if (q < 0)
                         return q;
 
-                alias_path = path_make_absolute(dst, config_path);
+                q = unit_file_verify_alias(i, dst, &dst_updated);
+                if (q < 0)
+                        continue;
+
+                alias_path = path_make_absolute(dst_updated ?: dst, config_path);
                 if (!alias_path)
                         return -ENOMEM;
 
@@ -1788,7 +1883,8 @@ static int install_info_symlink_wants(
                         return q;
 
                 if (!unit_name_is_valid(dst, UNIT_NAME_ANY)) {
-                        r = -EINVAL;
+                        unit_file_changes_add(changes, n_changes, -EUCLEAN, dst, NULL);
+                        r = -EUCLEAN;
                         continue;
                 }
 
@@ -2287,7 +2383,7 @@ int unit_file_revert(
                                         return -errno;
                         } else if (S_ISREG(st.st_mode)) {
                                 /* Check if there's a vendor version */
-                                r = path_is_vendor(&paths, path);
+                                r = path_is_vendor_or_generator(&paths, path);
                                 if (r < 0)
                                         return r;
                                 if (r > 0)

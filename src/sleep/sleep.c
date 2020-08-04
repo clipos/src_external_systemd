@@ -9,7 +9,6 @@
 #include <getopt.h>
 #include <linux/fiemap.h>
 #include <poll.h>
-#include <stdio.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/timerfd.h>
@@ -18,11 +17,12 @@
 #include "sd-messages.h"
 
 #include "btrfs-util.h"
+#include "bus-error.h"
 #include "def.h"
 #include "exec-util.h"
 #include "fd-util.h"
-#include "format-util.h"
 #include "fileio.h"
+#include "format-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "parse-util.h"
@@ -38,78 +38,48 @@ static char* arg_verb = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_verb, freep);
 
-static int write_hibernate_location_info(void) {
-        _cleanup_free_ char *device = NULL, *type = NULL;
-        _cleanup_free_ struct fiemap *fiemap = NULL;
+static int write_hibernate_location_info(const HibernateLocation *hibernate_location) {
         char offset_str[DECIMAL_STR_MAX(uint64_t)];
-        char device_str[DECIMAL_STR_MAX(uint64_t)];
-        _cleanup_close_ int fd = -1;
-        struct stat stb;
-        uint64_t offset;
+        char resume_str[DECIMAL_STR_MAX(unsigned) * 2 + STRLEN(":")];
         int r;
 
-        r = find_hibernate_location(&device, &type, NULL, NULL);
+        assert(hibernate_location);
+        assert(hibernate_location->swap);
+
+        xsprintf(resume_str, "%u:%u", major(hibernate_location->devno), minor(hibernate_location->devno));
+        r = write_string_file("/sys/power/resume", resume_str, WRITE_STRING_FILE_DISABLE_BUFFER);
         if (r < 0)
-                return log_debug_errno(r, "Unable to find hibernation location: %m");
+                return log_debug_errno(r, "Failed to write partition device to /sys/power/resume for '%s': '%s': %m",
+                                       hibernate_location->swap->device, resume_str);
 
-        /* if it's a swap partition, we just write the disk to /sys/power/resume */
-        if (streq(type, "partition")) {
-                r = write_string_file("/sys/power/resume", device, WRITE_STRING_FILE_DISABLE_BUFFER);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to write partition device to /sys/power/resume: %m");
+        log_debug("Wrote resume= value for %s to /sys/power/resume: %s", hibernate_location->swap->device, resume_str);
 
+        /* if it's a swap partition, we're done */
+        if (streq(hibernate_location->swap->type, "partition"))
                 return r;
-        }
-        if (!streq(type, "file"))
+
+        if (!streq(hibernate_location->swap->type, "file"))
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Invalid hibernate type: %s", type);
+                                       "Invalid hibernate type: %s", hibernate_location->swap->type);
 
         /* Only available in 4.17+ */
-        if (access("/sys/power/resume_offset", W_OK) < 0) {
+        if (hibernate_location->offset > 0 && access("/sys/power/resume_offset", W_OK) < 0) {
                 if (errno == ENOENT) {
-                        log_debug("Kernel too old, can't configure resume offset, ignoring.");
+                        log_debug("Kernel too old, can't configure resume_offset for %s, ignoring: %" PRIu64,
+                                  hibernate_location->swap->device, hibernate_location->offset);
                         return 0;
                 }
 
                 return log_debug_errno(errno, "/sys/power/resume_offset not writeable: %m");
         }
 
-        fd = open(device, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-        if (fd < 0)
-                return log_debug_errno(errno, "Unable to open '%s': %m", device);
-        r = fstat(fd, &stb);
-        if (r < 0)
-                return log_debug_errno(errno, "Unable to stat %s: %m", device);
-
-        r = btrfs_is_filesystem(fd);
-        if (r < 0)
-                return log_error_errno(r, "Error checking %s for Btrfs filesystem: %m", device);
-
-        if (r)
-                return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                       "Unable to calculate swapfile offset when using Btrfs: %s", device);
-
-        r = read_fiemap(fd, &fiemap);
-        if (r < 0)
-                return log_debug_errno(r, "Unable to read extent map for '%s': %m", device);
-        if (fiemap->fm_mapped_extents == 0)
-                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "No extents found in '%s'", device);
-
-        offset = fiemap->fm_extents[0].fe_physical / page_size();
-        xsprintf(offset_str, "%" PRIu64, offset);
+        xsprintf(offset_str, "%" PRIu64, hibernate_location->offset);
         r = write_string_file("/sys/power/resume_offset", offset_str, WRITE_STRING_FILE_DISABLE_BUFFER);
         if (r < 0)
-                return log_debug_errno(r, "Failed to write offset '%s': %m", offset_str);
+                return log_debug_errno(r, "Failed to write swap file offset to /sys/power/resume_offset for '%s': '%s': %m",
+                                       hibernate_location->swap->device, offset_str);
 
-        log_debug("Wrote calculated resume_offset value to /sys/power/resume_offset: %s", offset_str);
-
-        xsprintf(device_str, "%lx", (unsigned long)stb.st_dev);
-        r = write_string_file("/sys/power/resume", device_str, WRITE_STRING_FILE_DISABLE_BUFFER);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to write device '%s': %m", device_str);
-
-        log_debug("Wrote device id to /sys/power/resume: %s", device_str);
+        log_debug("Wrote resume_offset= value for %s to /sys/power/resume_offset: %s", hibernate_location->swap->device, offset_str);
 
         return 0;
 }
@@ -137,6 +107,9 @@ static int write_state(FILE **f, char **states) {
         char **state;
         int r = 0;
 
+        assert(f);
+        assert(*f);
+
         STRV_FOREACH(state, states) {
                 int k;
 
@@ -156,30 +129,47 @@ static int write_state(FILE **f, char **states) {
         return r;
 }
 
-static int configure_hibernation(void) {
-        _cleanup_free_ char *resume = NULL, *resume_offset = NULL;
+static int lock_all_homes(void) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
-        /* check for proper hibernation configuration */
-        r = read_one_line_file("/sys/power/resume", &resume);
+        /* Let's synchronously lock all home directories managed by homed that have been marked for it. This
+         * way the key material required to access these volumes is hopefully removed from memory. */
+
+        r = sd_bus_open_system(&bus);
         if (r < 0)
-                return log_debug_errno(r, "Error reading from /sys/power/resume: %m");
+                return log_warning_errno(r, "Failed to connect to system bus, ignoring: %m");
 
-        r = read_one_line_file("/sys/power/resume_offset", &resume_offset);
+        r = sd_bus_message_new_method_call(
+                        bus,
+                        &m,
+                        "org.freedesktop.home1",
+                        "/org/freedesktop/home1",
+                        "org.freedesktop.home1.Manager",
+                        "LockAllHomes");
         if (r < 0)
-                return log_debug_errno(r, "Error reading from /sys/power/resume_offset: %m");
+                return bus_log_create_error(r);
 
-        if (!streq(resume_offset, "0") && !streq(resume, "0:0")) {
-                log_debug("Hibernating using device id and offset read from /sys/power/resume: %s and /sys/power/resume_offset: %s", resume, resume_offset);
-                return 0;
-        } else if (!streq(resume, "0:0")) {
-                log_debug("Hibernating using device id read from /sys/power/resume: %s", resume);
-                return 0;
-        } else if (!streq(resume_offset, "0"))
-                log_debug("Found offset in /sys/power/resume_offset: %s; no device id found in /sys/power/resume; ignoring offset", resume_offset);
+        /* If homed is not running it can't have any home directories active either. */
+        r = sd_bus_message_set_auto_start(m, false);
+        if (r < 0)
+                return log_error_errno(r, "Failed to disable auto-start of LockAllHomes() message: %m");
 
-        /* if hibernation is not properly configured, attempt to calculate and write values */
-        return write_hibernate_location_info();
+        r = sd_bus_call(bus, m, DEFAULT_TIMEOUT_USEC, &error, NULL);
+        if (r < 0) {
+                if (sd_bus_error_has_name(&error, SD_BUS_ERROR_SERVICE_UNKNOWN) ||
+                    sd_bus_error_has_name(&error, SD_BUS_ERROR_NAME_HAS_NO_OWNER)) {
+                        log_debug("systemd-homed is not running, skipping locking of home directories.");
+                        return 0;
+                }
+
+                return log_error_errno(r, "Failed to lock home directories: %s", bus_error_message(&error, r));
+        }
+
+        log_debug("Successfully requested for all home directories to be locked.");
+        return 0;
 }
 
 static int execute(char **modes, char **states) {
@@ -194,8 +184,9 @@ static int execute(char **modes, char **states) {
                 NULL
         };
 
-        int r;
         _cleanup_fclose_ FILE *f = NULL;
+        _cleanup_(hibernate_location_freep) HibernateLocation *hibernate_location = NULL;
+        int r;
 
         /* This file is opened first, so that if we hit an error,
          * we can abort before modifying any state. */
@@ -205,11 +196,18 @@ static int execute(char **modes, char **states) {
 
         setvbuf(f, NULL, _IONBF, 0);
 
-        /* Configure the hibernation mode */
+        /* Configure hibernation settings if we are supposed to hibernate */
         if (!strv_isempty(modes)) {
-                r = configure_hibernation();
+                r = find_hibernate_location(&hibernate_location);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to prepare for hibernation: %m");
+                        return log_error_errno(r, "Failed to find location to hibernate to: %m");
+                if (r == 0) { /* 0 means: no hibernation location was configured in the kernel so far, let's
+                               * do it ourselves then. > 0 means: kernel already had a configured hibernation
+                               * location which we shouldn't touch. */
+                        r = write_hibernate_location_info(hibernate_location);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to prepare for hibernation: %m");
+                }
 
                 r = write_mode(modes);
                 if (r < 0)
@@ -217,6 +215,7 @@ static int execute(char **modes, char **states) {
         }
 
         (void) execute_directories(dirs, DEFAULT_TIMEOUT_USEC, NULL, NULL, arguments, NULL, EXEC_DIR_PARALLEL | EXEC_DIR_IGNORE_ERRORS);
+        (void) lock_all_homes();
 
         log_struct(LOG_INFO,
                    "MESSAGE_ID=" SD_MESSAGE_SLEEP_START_STR,
@@ -286,12 +285,11 @@ static int execute_s2h(const SleepConfig *sleep_config) {
 
         r = execute(sleep_config->hibernate_modes, sleep_config->hibernate_states);
         if (r < 0) {
-                log_notice("Couldn't hibernate, will try to suspend again.");
+                log_notice_errno(r, "Couldn't hibernate, will try to suspend again: %m");
+
                 r = execute(sleep_config->suspend_modes, sleep_config->suspend_states);
-                if (r < 0) {
-                        log_notice("Could neither hibernate nor suspend again, giving up.");
-                        return r;
-                }
+                if (r < 0)
+                        return log_error_errno(r, "Could neither hibernate nor suspend, giving up: %m");
         }
 
         return 0;

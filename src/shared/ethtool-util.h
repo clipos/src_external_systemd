@@ -2,6 +2,7 @@
 #pragma once
 
 #include <macro.h>
+#include <net/ethernet.h>
 #include <linux/ethtool.h>
 
 #include "conf-parser.h"
@@ -31,6 +32,8 @@ typedef enum WakeOnLan {
 } WakeOnLan;
 
 typedef enum NetDevFeature {
+        NET_DEV_FEAT_RX,
+        NET_DEV_FEAT_TX,
         NET_DEV_FEAT_GSO,
         NET_DEV_FEAT_GRO,
         NET_DEV_FEAT_LRO,
@@ -79,17 +82,27 @@ typedef struct netdev_channels {
         bool combined_count_set;
 } netdev_channels;
 
-int ethtool_get_driver(int *fd, const char *ifname, char **ret);
-int ethtool_get_link_info(int *fd, const char *ifname,
-                          int *ret_autonegotiation, size_t *ret_speed,
+typedef struct netdev_ring_param {
+        uint32_t rx_pending;
+        uint32_t tx_pending;
+
+        bool rx_pending_set;
+        bool tx_pending_set;
+} netdev_ring_param;
+
+int ethtool_get_driver(int *ethtool_fd, const char *ifname, char **ret);
+int ethtool_get_link_info(int *ethtool_fd, const char *ifname,
+                          int *ret_autonegotiation, uint64_t *ret_speed,
                           Duplex *ret_duplex, NetDevPort *ret_port);
-int ethtool_set_speed(int *fd, const char *ifname, unsigned speed, Duplex duplex);
-int ethtool_set_wol(int *fd, const char *ifname, WakeOnLan wol);
-int ethtool_set_features(int *fd, const char *ifname, int *features);
-int ethtool_set_glinksettings(int *fd, const char *ifname,
+int ethtool_get_permanent_macaddr(int *ethtool_fd, const char *ifname, struct ether_addr *ret);
+int ethtool_set_speed(int *ethtool_fd, const char *ifname, unsigned speed, Duplex duplex);
+int ethtool_set_wol(int *ethtool_fd, const char *ifname, WakeOnLan wol);
+int ethtool_set_nic_buffer_size(int *ethtool_fd, const char *ifname, netdev_ring_param *ring);
+int ethtool_set_features(int *ethtool_fd, const char *ifname, int *features);
+int ethtool_set_glinksettings(int *ethtool_fd, const char *ifname,
                               int autonegotiation, uint32_t advertise[static N_ADVERTISE],
-                              size_t speed, Duplex duplex, NetDevPort port);
-int ethtool_set_channels(int *fd, const char *ifname, netdev_channels *channels);
+                              uint64_t speed, Duplex duplex, NetDevPort port);
+int ethtool_set_channels(int *ethtool_fd, const char *ifname, netdev_channels *channels);
 
 const char *duplex_to_string(Duplex d) _const_;
 Duplex duplex_from_string(const char *d) _pure_;
@@ -108,3 +121,4 @@ CONFIG_PARSER_PROTOTYPE(config_parse_wol);
 CONFIG_PARSER_PROTOTYPE(config_parse_port);
 CONFIG_PARSER_PROTOTYPE(config_parse_channel);
 CONFIG_PARSER_PROTOTYPE(config_parse_advertise);
+CONFIG_PARSER_PROTOTYPE(config_parse_nic_buffer_size);

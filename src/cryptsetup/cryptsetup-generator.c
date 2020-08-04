@@ -37,6 +37,8 @@ typedef struct crypto_device {
 static const char *arg_dest = NULL;
 static bool arg_enabled = true;
 static bool arg_read_crypttab = true;
+static const char *arg_crypttab = NULL;
+static const char *arg_runtime_directory = NULL;
 static bool arg_whitelist = false;
 static Hashmap *arg_disks = NULL;
 static char *arg_default_options = NULL;
@@ -97,7 +99,14 @@ static int split_keyspec(const char *keyspec, char **ret_keyfile, char **ret_key
         return 0;
 }
 
-static int generate_keydev_mount(const char *name, const char *keydev, const char *keydev_timeout, bool canfail, char **unit, char **mount) {
+static int generate_keydev_mount(
+                const char *name,
+                const char *keydev,
+                const char *keydev_timeout,
+                bool canfail,
+                char **unit,
+                char **mount) {
+
         _cleanup_free_ char *u = NULL, *where = NULL, *name_escaped = NULL, *device_unit = NULL;
         _cleanup_fclose_ FILE *f = NULL;
         int r;
@@ -108,11 +117,11 @@ static int generate_keydev_mount(const char *name, const char *keydev, const cha
         assert(unit);
         assert(mount);
 
-        r = mkdir_parents("/run/systemd/cryptsetup", 0755);
+        r = mkdir_parents(arg_runtime_directory, 0755);
         if (r < 0)
                 return r;
 
-        r = mkdir("/run/systemd/cryptsetup", 0700);
+        r = mkdir(arg_runtime_directory, 0700);
         if (r < 0 && errno != EEXIST)
                 return -errno;
 
@@ -120,7 +129,7 @@ static int generate_keydev_mount(const char *name, const char *keydev, const cha
         if (!name_escaped)
                 return -ENOMEM;
 
-        where = strjoin("/run/systemd/cryptsetup/keydev-", name_escaped);
+        where = strjoin(arg_runtime_directory, "/keydev-", name_escaped);
         if (!where)
                 return -ENOMEM;
 
@@ -221,11 +230,11 @@ static int create_disk(
                 const char *options) {
 
         _cleanup_free_ char *n = NULL, *d = NULL, *u = NULL, *e = NULL,
-                *keydev_mount = NULL, *keyfile_timeout_value = NULL, *password_escaped = NULL,
-                *filtered = NULL, *u_escaped = NULL, *filtered_escaped = NULL, *name_escaped = NULL, *header_path = NULL;
+                *keydev_mount = NULL, *keyfile_timeout_value = NULL,
+                *filtered = NULL, *u_escaped = NULL, *name_escaped = NULL, *header_path = NULL, *password_buffer = NULL;
         _cleanup_fclose_ FILE *f = NULL;
         const char *dmname;
-        bool noauto, nofail, tmp, swap, netdev;
+        bool noauto, nofail, tmp, swap, netdev, attach_in_initrd;
         int r, detached_header, keyfile_can_timeout;
 
         assert(name);
@@ -236,6 +245,7 @@ static int create_disk(
         tmp = fstab_test_option(options, "tmp\0");
         swap = fstab_test_option(options, "swap\0");
         netdev = fstab_test_option(options, "_netdev\0");
+        attach_in_initrd = fstab_test_option(options, "x-initrd.attach\0");
 
         keyfile_can_timeout = fstab_filter_options(options, "keyfile-timeout\0", NULL, &keyfile_timeout_value, NULL);
         if (keyfile_can_timeout < 0)
@@ -282,35 +292,29 @@ static int create_disk(
         if (r < 0)
                 return r;
 
-        fprintf(f,
-                "[Unit]\n"
-                "Description=Cryptography Setup for %%I\n"
-                "Documentation=man:crypttab(5) man:systemd-cryptsetup-generator(8) man:systemd-cryptsetup@.service(8)\n"
-                "SourcePath=/etc/crypttab\n"
-                "DefaultDependencies=no\n"
-                "Conflicts=umount.target\n"
-                "IgnoreOnIsolate=true\n"
-                "After=%s\n",
-                netdev ? "remote-fs-pre.target" : "cryptsetup-pre.target");
+        r = generator_write_cryptsetup_unit_section(f, arg_crypttab);
+        if (r < 0)
+                return r;
 
-        if (password) {
-                password_escaped = specifier_escape(password);
-                if (!password_escaped)
-                        return log_oom();
-        }
+        if (netdev)
+                fprintf(f, "After=remote-fs-pre.target\n");
+
+        /* If initrd takes care of attaching the disk then it should also detach it during shutdown. */
+        if (!attach_in_initrd)
+                fprintf(f, "Conflicts=umount.target\n");
 
         if (keydev) {
-                _cleanup_free_ char *unit = NULL, *p = NULL;
+                _cleanup_free_ char *unit = NULL;
 
                 r = generate_keydev_mount(name, keydev, keyfile_timeout_value, keyfile_can_timeout > 0, &unit, &keydev_mount);
                 if (r < 0)
                         return log_error_errno(r, "Failed to generate keydev mount unit: %m");
 
-                p = path_join(keydev_mount, password_escaped);
-                if (!p)
+                password_buffer = path_join(keydev_mount, password);
+                if (!password_buffer)
                         return log_oom();
 
-                free_and_replace(password_escaped, p);
+                password = password_buffer;
 
                 fprintf(f, "After=%s\n", unit);
                 if (keyfile_can_timeout > 0)
@@ -337,17 +341,13 @@ static int create_disk(
                         return r;
         }
 
-        if (path_startswith(u, "/dev/")) {
+        if (path_startswith(u, "/dev/"))
                 fprintf(f,
                         "BindsTo=%s\n"
                         "After=%s\n"
                         "Before=umount.target\n",
                         d, d);
-
-                if (swap)
-                        fputs("Before=dev-mapper-%i.swap\n",
-                              f);
-        } else
+        else
                 /* For loopback devices, add systemd-tmpfiles-setup-dev.service
                    dependency to ensure that loopback support is available in
                    the kernel (/dev/loop-control needs to exist) */
@@ -359,25 +359,11 @@ static int create_disk(
 
         r = generator_write_timeouts(arg_dest, device, name, options, &filtered);
         if (r < 0)
+                log_warning_errno(r, "Failed to write device timeout drop-in: %m");
+
+        r = generator_write_cryptsetup_service_section(f, name, u, password, filtered);
+        if (r < 0)
                 return r;
-
-        if (filtered) {
-                filtered_escaped = specifier_escape(filtered);
-                if (!filtered_escaped)
-                        return log_oom();
-        }
-
-        fprintf(f,
-                "\n[Service]\n"
-                "Type=oneshot\n"
-                "RemainAfterExit=yes\n"
-                "TimeoutSec=0\n" /* the binary handles timeouts anyway */
-                "KeyringMode=shared\n" /* make sure we can share cached keys among instances */
-                "OOMScoreAdjust=500\n" /* unlocking can allocate a lot of memory if Argon2 is used */
-                "ExecStart=" SYSTEMD_CRYPTSETUP_PATH " attach '%s' '%s' '%s' '%s'\n"
-                "ExecStop=" SYSTEMD_CRYPTSETUP_PATH " detach '%s'\n",
-                name_escaped, u_escaped, strempty(password_escaped), strempty(filtered_escaped),
-                name_escaped);
 
         if (tmp)
                 fprintf(f,
@@ -412,11 +398,11 @@ static int create_disk(
                 return r;
 
         if (!noauto && !nofail) {
-                r = write_drop_in(arg_dest, dmname, 90, "device-timeout",
-                                  "# Automatically generated by systemd-cryptsetup-generator \n\n"
+                r = write_drop_in(arg_dest, dmname, 40, "device-timeout",
+                                  "# Automatically generated by systemd-cryptsetup-generator\n\n"
                                   "[Unit]\nJobTimeoutSec=0");
                 if (r < 0)
-                        return log_error_errno(r, "Failed to write device drop-in: %m");
+                        log_warning_errno(r, "Failed to write device timeout drop-in: %m");
         }
 
         return 0;
@@ -573,15 +559,15 @@ static int add_crypttab_devices(void) {
         if (!arg_read_crypttab)
                 return 0;
 
-        r = fopen_unlocked("/etc/crypttab", "re", &f);
+        r = fopen_unlocked(arg_crypttab, "re", &f);
         if (r < 0) {
                 if (errno != ENOENT)
-                        log_error_errno(errno, "Failed to open /etc/crypttab: %m");
+                        log_error_errno(errno, "Failed to open %s: %m", arg_crypttab);
                 return 0;
         }
 
         if (fstat(fileno(f), &st) < 0) {
-                log_error_errno(errno, "Failed to stat /etc/crypttab: %m");
+                log_error_errno(errno, "Failed to stat %s: %m", arg_crypttab);
                 return 0;
         }
 
@@ -593,7 +579,7 @@ static int add_crypttab_devices(void) {
 
                 r = read_line(f, LONG_LINE_MAX, &line);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to read /etc/crypttab: %m");
+                        return log_error_errno(r, "Failed to read %s: %m", arg_crypttab);
                 if (r == 0)
                         break;
 
@@ -605,7 +591,7 @@ static int add_crypttab_devices(void) {
 
                 k = sscanf(l, "%ms %ms %ms %ms", &name, &device, &keyspec, &options);
                 if (k < 2 || k > 4) {
-                        log_error("Failed to parse /etc/crypttab:%u, ignoring.", crypttab_line);
+                        log_error("Failed to parse %s:%u, ignoring.", arg_crypttab, crypttab_line);
                         continue;
                 }
 
@@ -643,7 +629,6 @@ static int add_proc_cmdline_devices(void) {
         crypto_device *d;
 
         HASHMAP_FOREACH(d, arg_disks, i) {
-                const char *options;
                 _cleanup_free_ char *device = NULL;
 
                 if (!d->create)
@@ -659,14 +644,11 @@ static int add_proc_cmdline_devices(void) {
                 if (!device)
                         return log_oom();
 
-                if (d->options)
-                        options = d->options;
-                else if (arg_default_options)
-                        options = arg_default_options;
-                else
-                        options = "timeout=0";
-
-                r = create_disk(d->name, device, d->keyfile ?: arg_default_keyfile, d->keydev, options);
+                r = create_disk(d->name,
+                                device,
+                                d->keyfile ?: arg_default_keyfile,
+                                d->keydev,
+                                d->options ?: arg_default_options);
                 if (r < 0)
                         return r;
         }
@@ -681,6 +663,9 @@ static int run(const char *dest, const char *dest_early, const char *dest_late) 
         int r;
 
         assert_se(arg_dest = dest);
+
+        arg_crypttab = getenv("SYSTEMD_CRYPTTAB") ?: "/etc/crypttab";
+        arg_runtime_directory = getenv("RUNTIME_DIRECTORY") ?: "/run/systemd/cryptsetup";
 
         arg_disks = hashmap_new(&crypt_device_hash_ops);
         if (!arg_disks)

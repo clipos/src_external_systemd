@@ -8,8 +8,6 @@
 #include <linux/fs.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdio.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -17,6 +15,8 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "blockdev-util.h"
+#include "btrfs-util.h"
 #include "conf-parser.h"
 #include "def.h"
 #include "env-util.h"
@@ -28,6 +28,7 @@
 #include "parse-util.h"
 #include "path-util.h"
 #include "sleep-config.h"
+#include "stdio-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
@@ -103,12 +104,16 @@ int can_sleep_state(char **types) {
                 return true;
 
         /* If /sys is read-only we cannot sleep */
-        if (access("/sys/power/state", W_OK) < 0)
+        if (access("/sys/power/state", W_OK) < 0) {
+                log_debug_errno(errno, "/sys/power/state is not writable, cannot sleep: %m");
                 return false;
+        }
 
         r = read_one_line_file("/sys/power/state", &p);
-        if (r < 0)
+        if (r < 0) {
+                log_debug_errno(r, "Failed to read /sys/power/state, cannot sleep: %m");
                 return false;
+        }
 
         STRV_FOREACH(type, types) {
                 const char *word, *state;
@@ -124,9 +129,9 @@ int can_sleep_state(char **types) {
 }
 
 int can_sleep_disk(char **types) {
+        _cleanup_free_ char *p = NULL;
         char **type;
         int r;
-        _cleanup_free_ char *p = NULL;
 
         if (strv_isempty(types))
                 return true;
@@ -165,16 +170,7 @@ int can_sleep_disk(char **types) {
 
 #define HIBERNATION_SWAP_THRESHOLD 0.98
 
-/* entry in /proc/swaps */
-typedef struct SwapEntry {
-        char *device;
-        char *type;
-        uint64_t size;
-        uint64_t used;
-        int priority;
-} SwapEntry;
-
-static SwapEntry* swap_entry_free(SwapEntry *se) {
+SwapEntry* swap_entry_free(SwapEntry *se) {
         if (!se)
                 return NULL;
 
@@ -184,29 +180,164 @@ static SwapEntry* swap_entry_free(SwapEntry *se) {
         return mfree(se);
 }
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(SwapEntry*, swap_entry_free);
+HibernateLocation* hibernate_location_free(HibernateLocation *hl) {
+        if (!hl)
+                return NULL;
 
-int find_hibernate_location(char **device, char **type, uint64_t *size, uint64_t *used) {
-        _cleanup_fclose_ FILE *f;
-        _cleanup_(swap_entry_freep) SwapEntry *selected_swap = NULL;
-        unsigned i;
+        swap_entry_free(hl->swap);
+
+        return mfree(hl);
+}
+
+static int swap_device_to_device_id(const SwapEntry *swap, dev_t *ret_dev) {
+        struct stat sb;
+        int r;
+
+        assert(swap);
+        assert(swap->device);
+        assert(swap->type);
+
+        r = stat(swap->device, &sb);
+        if (r < 0)
+                return -errno;
+
+        if (streq(swap->type, "partition")) {
+                if (!S_ISBLK(sb.st_mode))
+                        return -ENOTBLK;
+
+                *ret_dev = sb.st_rdev;
+                return 0;
+        }
+
+        return get_block_device(swap->device, ret_dev);
+}
+
+/*
+ * Attempt to calculate the swap file offset on supported filesystems. On unsuported
+ * filesystems, a debug message is logged and ret_offset is set to UINT64_MAX.
+ */
+static int calculate_swap_file_offset(const SwapEntry *swap, uint64_t *ret_offset) {
+        _cleanup_close_ int fd = -1;
+        _cleanup_free_ struct fiemap *fiemap = NULL;
+        struct stat sb;
+        int r, btrfs;
+
+        assert(swap);
+        assert(swap->device);
+        assert(streq(swap->type, "file"));
+
+        fd = open(swap->device, O_RDONLY|O_CLOEXEC|O_NOCTTY);
+        if (fd < 0)
+                return log_debug_errno(errno, "Failed to open swap file %s to determine on-disk offset: %m", swap->device);
+
+        if (fstat(fd, &sb) < 0)
+                return log_debug_errno(errno, "Failed to stat %s: %m", swap->device);
+
+        btrfs = btrfs_is_filesystem(fd);
+        if (btrfs < 0)
+                return log_debug_errno(btrfs, "Error checking %s for Btrfs filesystem: %m", swap->device);
+        if (btrfs > 0) {
+                log_debug("%s: detection of swap file offset on Btrfs is not supported", swap->device);
+                *ret_offset = UINT64_MAX;
+                return 0;
+        }
+
+        r = read_fiemap(fd, &fiemap);
+        if (r < 0)
+                return log_debug_errno(r, "Unable to read extent map for '%s': %m", swap->device);
+
+        *ret_offset = fiemap->fm_extents[0].fe_physical / page_size();
+        return 0;
+}
+
+static int read_resume_files(dev_t *ret_resume, uint64_t *ret_resume_offset) {
+        _cleanup_free_ char *resume_str = NULL, *resume_offset_str = NULL;
+        uint64_t resume_offset = 0;
+        dev_t resume;
+        int r;
+
+        r = read_one_line_file("/sys/power/resume", &resume_str);
+        if (r < 0)
+                return log_debug_errno(r, "Error reading /sys/power/resume: %m");
+
+        r = parse_dev(resume_str, &resume);
+        if (r < 0)
+                return log_debug_errno(r, "Error parsing /sys/power/resume device: %s: %m", resume_str);
+
+        r = read_one_line_file("/sys/power/resume_offset", &resume_offset_str);
+        if (r == -ENOENT)
+                log_debug_errno(r, "Kernel does not support resume_offset; swap file offset detection will be skipped.");
+        else if (r < 0)
+                return log_debug_errno(r, "Error reading /sys/power/resume_offset: %m");
+        else {
+                r = safe_atou64(resume_offset_str, &resume_offset);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to parse value in /sys/power/resume_offset \"%s\": %m", resume_offset_str);
+        }
+
+        if (resume_offset > 0 && resume == 0)
+                log_debug("Warning: found /sys/power/resume_offset==%" PRIu64 ", but /sys/power/resume unset. Misconfiguration?",
+                          resume_offset);
+
+        *ret_resume = resume;
+        *ret_resume_offset = resume_offset;
+
+        return 0;
+}
+
+/*
+ * Determine if the HibernateLocation matches the resume= (device) and resume_offset= (file).
+ */
+static bool location_is_resume_device(const HibernateLocation *location, dev_t sys_resume, uint64_t sys_offset) {
+        if (!location)
+                return false;
+
+        return  sys_resume > 0 &&
+                sys_resume == location->devno &&
+                (sys_offset == location->offset || (sys_offset > 0 && location->offset == UINT64_MAX));
+}
+
+/*
+ * Attempt to find the hibernation location by parsing /proc/swaps, /sys/power/resume, and
+ * /sys/power/resume_offset.
+ *
+ * Returns:
+ *  1 - Values are set in /sys/power/resume and /sys/power/resume_offset.
+ *      ret_hibernate_location will represent matching /proc/swap entry if identified or NULL if not.
+ *
+ *  0 - No values are set in /sys/power/resume and /sys/power/resume_offset.
+        ret_hibernate_location will represent the highest priority swap with most remaining space discovered in /proc/swaps.
+ *
+ *  Negative value in the case of error.
+ */
+int find_hibernate_location(HibernateLocation **ret_hibernate_location) {
+        _cleanup_fclose_ FILE *f = NULL;
+        _cleanup_(hibernate_location_freep) HibernateLocation *hibernate_location = NULL;
+        dev_t sys_resume;
+        uint64_t sys_offset = 0;
+        bool resume_match = false;
+        int r;
+
+        /* read the /sys/power/resume & /sys/power/resume_offset values */
+        r = read_resume_files(&sys_resume, &sys_offset);
+        if (r < 0)
+                return r;
 
         f = fopen("/proc/swaps", "re");
         if (!f) {
-                log_full(errno == ENOENT ? LOG_DEBUG : LOG_WARNING,
-                         "Failed to retrieve open /proc/swaps: %m");
-                return negative_errno();
+                log_debug_errno(errno, "Failed to open /proc/swaps: %m");
+                return errno == ENOENT ? -EOPNOTSUPP : -errno; /* Convert swap not supported to a recognizable error */
         }
 
         (void) fscanf(f, "%*s %*s %*s %*s %*s\n");
-
-        for (i = 1;; i++) {
+        for (unsigned i = 1;; i++) {
                 _cleanup_(swap_entry_freep) SwapEntry *swap = NULL;
+                uint64_t swap_offset = 0;
                 int k;
 
                 swap = new0(SwapEntry, 1);
                 if (!swap)
-                        return log_oom();
+                        return -ENOMEM;
 
                 k = fscanf(f,
                            "%ms "       /* device/file */
@@ -218,65 +349,129 @@ int find_hibernate_location(char **device, char **type, uint64_t *size, uint64_t
                 if (k == EOF)
                         break;
                 if (k != 5) {
-                        log_warning("Failed to parse /proc/swaps:%u", i);
+                        log_debug("Failed to parse /proc/swaps:%u, ignoring", i);
                         continue;
                 }
 
                 if (streq(swap->type, "file")) {
-
                         if (endswith(swap->device, "\\040(deleted)")) {
-                                log_warning("Ignoring deleted swap file '%s'.", swap->device);
+                                log_debug("Ignoring deleted swap file '%s'.", swap->device);
                                 continue;
                         }
+
+                        r = calculate_swap_file_offset(swap, &swap_offset);
+                        if (r < 0)
+                                return r;
 
                 } else if (streq(swap->type, "partition")) {
                         const char *fn;
 
                         fn = path_startswith(swap->device, "/dev/");
                         if (fn && startswith(fn, "zram")) {
-                                log_debug("Ignoring compressed RAM swap device '%s'.", swap->device);
+                                log_debug("%s: ignoring zram swap", swap->device);
                                 continue;
                         }
+
+                } else {
+                        log_debug("%s: swap type %s is unsupported for hibernation, ignoring", swap->device, swap->type);
+                        continue;
                 }
 
-                /* prefer highest priority or swap with most remaining space when same priority */
-                if (!selected_swap || swap->priority > selected_swap->priority
-                    || ((swap->priority == selected_swap->priority)
-                        && (swap->size - swap->used) > (selected_swap->size - selected_swap->used))) {
-                        selected_swap = swap_entry_free(selected_swap);
-                        selected_swap = TAKE_PTR(swap);
+                /* prefer resume device or highest priority swap with most remaining space */
+                if (hibernate_location && swap->priority < hibernate_location->swap->priority) {
+                        log_debug("%s: ignoring device with lower priority", swap->device);
+                        continue;
                 }
+                if (hibernate_location &&
+                    (swap->priority == hibernate_location->swap->priority
+                     && swap->size - swap->used < hibernate_location->swap->size - hibernate_location->swap->used)) {
+                        log_debug("%s: ignoring device with lower usable space", swap->device);
+                        continue;
+                }
+
+                dev_t swap_device;
+                r = swap_device_to_device_id(swap, &swap_device);
+                if (r < 0)
+                        return log_debug_errno(r, "%s: failed to query device number: %m", swap->device);
+
+                hibernate_location = hibernate_location_free(hibernate_location);
+                hibernate_location = new(HibernateLocation, 1);
+                if (!hibernate_location)
+                        return -ENOMEM;
+
+                *hibernate_location = (HibernateLocation) {
+                        .devno = swap_device,
+                        .offset = swap_offset,
+                        .swap = TAKE_PTR(swap),
+                };
+
+                /* if the swap is the resume device, stop the loop */
+                if (location_is_resume_device(hibernate_location, sys_resume, sys_offset)) {
+                        log_debug("%s: device matches configured resume settings.", hibernate_location->swap->device);
+                        resume_match = true;
+                        break;
+                }
+
+                log_debug("%s: is a candidate device.", hibernate_location->swap->device);
         }
 
-        if (!selected_swap)
-                return log_debug_errno(SYNTHETIC_ERRNO(ENOSYS), "No swap partitions or files were found.");
+        /* We found nothing at all */
+        if (!hibernate_location)
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOSYS),
+                                       "No possible swap partitions or files suitable for hibernation were found in /proc/swaps.");
 
-        /* use the swap entry with the highest priority */
-        if (device)
-                *device = TAKE_PTR(selected_swap->device);
-        if (type)
-                *type = TAKE_PTR(selected_swap->type);
-        if (size)
-                *size = selected_swap->size;
-        if (used)
-                *used = selected_swap->used;
+        /* resume= is set but a matching /proc/swaps entry was not found */
+        if (sys_resume != 0 && !resume_match)
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOSYS),
+                                       "No swap partitions or files matching resume config were found in /proc/swaps.");
 
-        log_debug("Highest priority swap entry found %s: %i", selected_swap->device, selected_swap->priority);
+        if (hibernate_location->offset == UINT64_MAX) {
+                if (sys_offset == 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(ENOSYS), "Offset detection failed and /sys/power/resume_offset is not set.");
+
+                hibernate_location->offset = sys_offset;
+        }
+
+        if (resume_match)
+                log_debug("Hibernation will attempt to use swap entry with path: %s, device: %u:%u, offset: %" PRIu64 ", priority: %i",
+                          hibernate_location->swap->device, major(hibernate_location->devno), minor(hibernate_location->devno),
+                          hibernate_location->offset, hibernate_location->swap->priority);
+        else
+                log_debug("/sys/power/resume is not configured; attempting to hibernate with path: %s, device: %u:%u, offset: %" PRIu64 ", priority: %i",
+                          hibernate_location->swap->device, major(hibernate_location->devno), minor(hibernate_location->devno),
+                          hibernate_location->offset, hibernate_location->swap->priority);
+
+        *ret_hibernate_location = TAKE_PTR(hibernate_location);
+
+        if (resume_match)
+                return 1;
 
         return 0;
 }
 
 static bool enough_swap_for_hibernation(void) {
         _cleanup_free_ char *active = NULL;
+        _cleanup_(hibernate_location_freep) HibernateLocation *hibernate_location = NULL;
         unsigned long long act = 0;
-        uint64_t size = 0, used = 0;
         int r;
 
         if (getenv_bool("SYSTEMD_BYPASS_HIBERNATION_MEMORY_CHECK") > 0)
                 return true;
 
-        r = find_hibernate_location(NULL, NULL, &size, &used);
+        r = find_hibernate_location(&hibernate_location);
         if (r < 0)
+                return false;
+
+        /* If /sys/power/{resume,resume_offset} is configured but a matching entry
+         * could not be identified in /proc/swaps, user is likely using Btrfs with a swapfile;
+         * return true and let the system attempt hibernation.
+         */
+        if (r > 0 && !hibernate_location) {
+                log_debug("Unable to determine remaining swap space; hibernation may fail");
+                return true;
+        }
+
+        if (!hibernate_location)
                 return false;
 
         r = get_proc_field("/proc/meminfo", "Active(anon)", WHITESPACE, &active);
@@ -291,9 +486,9 @@ static bool enough_swap_for_hibernation(void) {
                 return false;
         }
 
-        r = act <= (size - used) * HIBERNATION_SWAP_THRESHOLD;
+        r = act <= (hibernate_location->swap->size - hibernate_location->swap->used) * HIBERNATION_SWAP_THRESHOLD;
         log_debug("%s swap for hibernation, Active(anon)=%llu kB, size=%" PRIu64 " kB, used=%" PRIu64 " kB, threshold=%.2g%%",
-                  r ? "Enough" : "Not enough", act, size, used, 100*HIBERNATION_SWAP_THRESHOLD);
+                  r ? "Enough" : "Not enough", act, hibernate_location->swap->size, hibernate_location->swap->used, 100*HIBERNATION_SWAP_THRESHOLD);
 
         return r;
 }
@@ -389,8 +584,7 @@ static bool can_s2h(const SleepConfig *sleep_config) {
         int r;
 
         if (!clock_supported(CLOCK_BOOTTIME_ALARM)) {
-                log_full(errno == ENOENT ? LOG_DEBUG : LOG_WARNING,
-                         "CLOCK_BOOTTIME_ALARM is not supported");
+                log_debug("CLOCK_BOOTTIME_ALARM is not supported.");
                 return false;
         }
 
@@ -479,9 +673,9 @@ int sleep_settings(const char *verb, const SleepConfig *sleep_config, bool *ret_
         return 0;
 }
 
-void free_sleep_config(SleepConfig *sc) {
+SleepConfig* free_sleep_config(SleepConfig *sc) {
         if (!sc)
-                return;
+                return NULL;
 
         strv_free(sc->suspend_modes);
         strv_free(sc->suspend_states);
@@ -492,5 +686,5 @@ void free_sleep_config(SleepConfig *sc) {
         strv_free(sc->hybrid_modes);
         strv_free(sc->hybrid_states);
 
-        free(sc);
+        return mfree(sc);
 }

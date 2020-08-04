@@ -6,11 +6,9 @@
 #include <netinet/ip.h>
 #include <resolv.h>
 #include <stdlib.h>
-#include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <sys/timex.h>
 #include <sys/types.h>
-#include <time.h>
 
 #include "sd-daemon.h"
 
@@ -21,7 +19,6 @@
 #include "fs-util.h"
 #include "list.h"
 #include "log.h"
-#include "missing.h"
 #include "network-util.h"
 #include "ratelimit.h"
 #include "resolve-private.h"
@@ -113,7 +110,7 @@ static int manager_send_request(Manager *m) {
 
         r = manager_listen_setup(m);
         if (r < 0)
-                return log_warning_errno(r, "Failed to setup connection socket: %m");
+                return log_warning_errno(r, "Failed to set up connection socket: %m");
 
         /*
          * Set transmit timestamp, remember it; the server will send that back
@@ -441,12 +438,11 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                 return manager_connect(m);
         }
 
-        len = recvmsg(fd, &msghdr, MSG_DONTWAIT);
+        len = recvmsg_safe(fd, &msghdr, MSG_DONTWAIT);
+        if (len == -EAGAIN)
+                return 0;
         if (len < 0) {
-                if (errno == EAGAIN)
-                        return 0;
-
-                log_warning("Error receiving message. Disconnecting.");
+                log_warning_errno(len, "Error receiving message, disconnecting: %m");
                 return manager_connect(m);
         }
 
@@ -517,7 +513,7 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
 
         root_distance = ntp_ts_short_to_d(&ntpmsg.root_delay) / 2 + ntp_ts_short_to_d(&ntpmsg.root_dispersion);
         if (root_distance > (double) m->max_root_distance_usec / (double) USEC_PER_SEC) {
-                log_debug("Server has too large root distance. Disconnecting.");
+                log_info("Server has too large root distance. Disconnecting.");
                 return manager_connect(m);
         }
 
@@ -1094,7 +1090,7 @@ int manager_new(Manager **ret) {
 
         m->server_socket = m->clock_watch_fd = -1;
 
-        RATELIMIT_INIT(m->ratelimit, RATELIMIT_INTERVAL_USEC, RATELIMIT_BURST);
+        m->ratelimit = (RateLimit) { RATELIMIT_INTERVAL_USEC, RATELIMIT_BURST };
 
         r = sd_event_default(&m->event);
         if (r < 0)

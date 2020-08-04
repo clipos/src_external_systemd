@@ -2,7 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include "sd-daemon.h"
@@ -10,7 +10,7 @@
 
 #include "alloc-util.h"
 #include "bus-error.h"
-#include "bus-util.h"
+#include "bus-polkit.h"
 #include "cgroup-util.h"
 #include "def.h"
 #include "device-util.h"
@@ -31,6 +31,7 @@
 #include "strv.h"
 #include "terminal-util.h"
 #include "udev-util.h"
+#include "user-util.h"
 
 static Manager* manager_unref(Manager *m);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_unref);
@@ -324,11 +325,18 @@ static int manager_enumerate_users(Manager *m) {
 
         FOREACH_DIRENT(de, d, return -errno) {
                 User *u;
+                uid_t uid;
 
                 if (!dirent_is_file(de))
                         continue;
 
-                k = manager_add_user_by_name(m, de->d_name, &u);
+                k = parse_uid(de->d_name, &uid);
+                if (k < 0) {
+                        r = log_warning_errno(k, "Failed to parse filename /run/systemd/users/%s as UID.", de->d_name);
+                        continue;
+                }
+
+                k = manager_add_user_by_uid(m, uid, &u);
                 if (k < 0) {
                         r = log_warning_errno(k, "Failed to add user by file name %s, ignoring: %m", de->d_name);
                         continue;

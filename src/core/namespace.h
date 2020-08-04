@@ -51,6 +51,7 @@ struct NamespaceInfo {
         bool protect_control_groups:1;
         bool protect_kernel_tunables:1;
         bool protect_kernel_modules:1;
+        bool protect_kernel_logs:1;
         bool mount_apivfs:1;
         bool protect_hostname:1;
 };
@@ -83,6 +84,7 @@ int setup_namespace(
                 size_t n_temporary_filesystems,
                 const char *tmp_dir,
                 const char *var_tmp_dir,
+                const char *log_namespace,
                 ProtectHome protect_home,
                 ProtectSystem protect_system,
                 unsigned long mount_flags,

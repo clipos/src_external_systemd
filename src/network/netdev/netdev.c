@@ -4,41 +4,41 @@
 #include <netinet/in.h>
 
 #include "alloc-util.h"
+#include "bond.h"
+#include "bridge.h"
 #include "conf-files.h"
 #include "conf-parser.h"
+#include "dummy.h"
 #include "fd-util.h"
+#include "fou-tunnel.h"
+#include "geneve.h"
+#include "ifb.h"
+#include "ipvlan.h"
+#include "l2tp-tunnel.h"
 #include "list.h"
-#include "netdev/bond.h"
-#include "netdev/bridge.h"
-#include "netdev/dummy.h"
-#include "netdev/fou-tunnel.h"
-#include "netdev/geneve.h"
-#include "netdev/ipvlan.h"
-#include "netdev/l2tp-tunnel.h"
-#include "netdev/macsec.h"
-#include "netdev/macvlan.h"
-#include "netdev/netdev.h"
-#include "netdev/netdevsim.h"
-#include "netdev/nlmon.h"
-#include "netdev/tunnel.h"
-#include "netdev/tuntap.h"
-#include "netdev/vcan.h"
-#include "netdev/veth.h"
-#include "netdev/vlan.h"
-#include "netdev/vrf.h"
-#include "netdev/vxcan.h"
-#include "netdev/vxlan.h"
-#include "netdev/wireguard.h"
-#include "netdev/xfrm.h"
+#include "macsec.h"
+#include "macvlan.h"
+#include "netdev.h"
+#include "netdevsim.h"
 #include "netlink-util.h"
 #include "network-internal.h"
-#include "networkd-link.h"
 #include "networkd-manager.h"
+#include "nlmon.h"
 #include "siphash24.h"
 #include "stat-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
+#include "tunnel.h"
+#include "tuntap.h"
+#include "vcan.h"
+#include "veth.h"
+#include "vlan.h"
+#include "vrf.h"
+#include "vxcan.h"
+#include "vxlan.h"
+#include "wireguard.h"
+#include "xfrm.h"
 
 const NetDevVTable * const netdev_vtable[_NETDEV_KIND_MAX] = {
         [NETDEV_KIND_BRIDGE] = &bridge_vtable,
@@ -74,6 +74,7 @@ const NetDevVTable * const netdev_vtable[_NETDEV_KIND_MAX] = {
         [NETDEV_KIND_MACSEC] = &macsec_vtable,
         [NETDEV_KIND_NLMON] = &nlmon_vtable,
         [NETDEV_KIND_XFRM] = &xfrm_vtable,
+        [NETDEV_KIND_IFB] = &ifb_vtable,
 };
 
 static const char* const netdev_kind_table[_NETDEV_KIND_MAX] = {
@@ -110,6 +111,7 @@ static const char* const netdev_kind_table[_NETDEV_KIND_MAX] = {
         [NETDEV_KIND_MACSEC] = "macsec",
         [NETDEV_KIND_NLMON] = "nlmon",
         [NETDEV_KIND_XFRM] = "xfrm",
+        [NETDEV_KIND_IFB] = "ifb",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(netdev_kind, NetDevKind);
@@ -683,9 +685,9 @@ int netdev_load_one(Manager *manager, const char *filename) {
 
         dropin_dirname = strjoina(basename(filename), ".d");
         r = config_parse_many(filename, NETWORK_DIRS, dropin_dirname,
-                              "Match\0NetDev\0",
+                              NETDEV_COMMON_SECTIONS NETDEV_OTHER_SECTIONS,
                               config_item_perf_lookup, network_netdev_gperf_lookup,
-                              CONFIG_PARSE_WARN|CONFIG_PARSE_RELAXED, netdev_raw);
+                              CONFIG_PARSE_WARN, netdev_raw, NULL);
         if (r < 0)
                 return r;
 
@@ -725,7 +727,7 @@ int netdev_load_one(Manager *manager, const char *filename) {
         r = config_parse_many(filename, NETWORK_DIRS, dropin_dirname,
                               NETDEV_VTABLE(netdev)->sections,
                               config_item_perf_lookup, network_netdev_gperf_lookup,
-                              CONFIG_PARSE_WARN, netdev);
+                              CONFIG_PARSE_WARN, netdev, NULL);
         if (r < 0)
                 return r;
 
@@ -757,9 +759,10 @@ int netdev_load_one(Manager *manager, const char *filename) {
                 NetDev *n = hashmap_get(netdev->manager->netdevs, netdev->ifname);
 
                 assert(n);
-                log_netdev_warning_errno(netdev, r,
-                                         "The setting Name=%s in %s conflicts with the one in %s, ignoring",
-                                         netdev->ifname, netdev->filename, n->filename);
+                if (!streq(netdev->filename, n->filename))
+                        log_netdev_warning_errno(netdev, r,
+                                                 "The setting Name=%s in %s conflicts with the one in %s, ignoring",
+                                                 netdev->ifname, netdev->filename, n->filename);
 
                 /* Clear ifname before netdev_free() is called. Otherwise, the NetDev object 'n' is
                  * removed from the hashmap 'manager->netdevs'. */
@@ -828,14 +831,15 @@ int netdev_load_one(Manager *manager, const char *filename) {
         return 0;
 }
 
-int netdev_load(Manager *manager) {
+int netdev_load(Manager *manager, bool reload) {
         _cleanup_strv_free_ char **files = NULL;
         char **f;
         int r;
 
         assert(manager);
 
-        hashmap_clear_with_destructor(manager->netdevs, netdev_unref);
+        if (!reload)
+                hashmap_clear_with_destructor(manager->netdevs, netdev_unref);
 
         r = conf_files_list_strv(&files, ".netdev", NULL, 0, NETWORK_DIRS);
         if (r < 0)

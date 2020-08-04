@@ -5,7 +5,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "alloc-util.h"
 #include "escape.h"
@@ -114,7 +113,7 @@ static size_t strcspn_escaped(const char *s, const char *reject) {
         bool escaped = false;
         int n;
 
-        for (n=0; s[n]; n++) {
+        for (n = 0; s[n] != '\0'; n++) {
                 if (escaped)
                         escaped = false;
                 else if (s[n] == '\\')
@@ -123,8 +122,7 @@ static size_t strcspn_escaped(const char *s, const char *reject) {
                         break;
         }
 
-        /* if s ends in \, return index of previous char */
-        return n - escaped;
+        return n;
 }
 
 /* Split a string into words. */
@@ -743,7 +741,7 @@ static void advance_offsets(
 }
 
 char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
-        const char *i, *begin = NULL;
+        const char *begin = NULL;
         enum {
                 STATE_OTHER,
                 STATE_ESCAPE,
@@ -751,7 +749,7 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
                 STATE_CSO,
         } state = STATE_OTHER;
         char *obuf = NULL;
-        size_t osz = 0, isz, shift[2] = {};
+        size_t osz = 0, isz, shift[2] = {}, n_carriage_returns = 0;
         FILE *f;
 
         assert(ibuf);
@@ -762,6 +760,8 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
          * 1. Replaces TABs by 8 spaces
          * 2. Strips ANSI color sequences (a subset of CSI), i.e. ESC '[' … 'm' sequences
          * 3. Strips ANSI operating system sequences (CSO), i.e. ESC ']' … BEL sequences
+         * 4. Strip trailing \r characters (since they would "move the cursor", but have no
+         *    other effect).
          *
          * Everything else will be left as it is. In particular other ANSI sequences are left as they are, as
          * are any other special characters. Truncated ANSI sequences are left-as is too. This call is
@@ -777,14 +777,24 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
         if (!f)
                 return NULL;
 
-        for (i = *ibuf; i < *ibuf + isz + 1; i++) {
+        for (const char *i = *ibuf; i < *ibuf + isz + 1; i++) {
 
                 switch (state) {
 
                 case STATE_OTHER:
                         if (i >= *ibuf + isz) /* EOT */
                                 break;
-                        else if (*i == '\x1B')
+
+                        if (*i == '\r') {
+                                n_carriage_returns++;
+                                break;
+                        } else if (*i == '\n')
+                                /* Ignore carriage returns before new line */
+                                n_carriage_returns = 0;
+                        for (; n_carriage_returns > 0; n_carriage_returns--)
+                                fputc('\r', f);
+
+                        if (*i == '\x1B')
                                 state = STATE_ESCAPE;
                         else if (*i == '\t') {
                                 fputs("        ", f);
@@ -795,6 +805,8 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
                         break;
 
                 case STATE_ESCAPE:
+                        assert(n_carriage_returns == 0);
+
                         if (i >= *ibuf + isz) { /* EOT */
                                 fputc('\x1B', f);
                                 advance_offsets(i - *ibuf, highlight, shift, 1);
@@ -815,6 +827,7 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
                         break;
 
                 case STATE_CSI:
+                        assert(n_carriage_returns == 0);
 
                         if (i >= *ibuf + isz || /* EOT … */
                             !strchr("01234567890;m", *i)) { /* … or invalid chars in sequence */
@@ -829,6 +842,7 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
                         break;
 
                 case STATE_CSO:
+                        assert(n_carriage_returns == 0);
 
                         if (i >= *ibuf + isz || /* EOT … */
                             (*i != '\a' && (uint8_t) *i < 32U) || (uint8_t) *i > 126U) { /* … or invalid chars in sequence */
@@ -848,7 +862,6 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
                 fclose(f);
                 return mfree(obuf);
         }
-
         fclose(f);
 
         free_and_replace(*ibuf, obuf);
@@ -1040,6 +1053,8 @@ bool string_is_safe(const char *p) {
         if (!p)
                 return false;
 
+        /* Checks if the specified string contains no quotes or control characters */
+
         for (t = p; *t; t++) {
                 if (*t > 0 && *t < ' ') /* no control characters */
                         return false;
@@ -1049,4 +1064,132 @@ bool string_is_safe(const char *p) {
         }
 
         return true;
+}
+
+char* string_erase(char *x) {
+        if (!x)
+                return NULL;
+
+        /* A delicious drop of snake-oil! To be called on memory where we stored passphrases or so, after we
+         * used them. */
+        explicit_bzero_safe(x, strlen(x));
+        return x;
+}
+
+int string_truncate_lines(const char *s, size_t n_lines, char **ret) {
+        const char *p = s, *e = s;
+        bool truncation_applied = false;
+        char *copy;
+        size_t n = 0;
+
+        assert(s);
+
+        /* Truncate after the specified number of lines. Returns > 0 if a truncation was applied or == 0 if
+         * there were fewer lines in the string anyway. Trailing newlines on input are ignored, and not
+         * generated either. */
+
+        for (;;) {
+                size_t k;
+
+                k = strcspn(p, "\n");
+
+                if (p[k] == 0) {
+                        if (k == 0) /* final empty line */
+                                break;
+
+                        if (n >= n_lines) /* above threshold */
+                                break;
+
+                        e = p + k; /* last line to include */
+                        break;
+                }
+
+                assert(p[k] == '\n');
+
+                if (n >= n_lines)
+                        break;
+
+                if (k > 0)
+                        e = p + k;
+
+                p += k + 1;
+                n++;
+        }
+
+        /* e points after the last character we want to keep */
+        if (isempty(e))
+                copy = strdup(s);
+        else {
+                if (!in_charset(e, "\n")) /* We only consider things truncated if we remove something that
+                                           * isn't a new-line or a series of them */
+                        truncation_applied = true;
+
+                copy = strndup(s, e - s);
+        }
+        if (!copy)
+                return -ENOMEM;
+
+        *ret = copy;
+        return truncation_applied;
+}
+
+int string_extract_line(const char *s, size_t i, char **ret) {
+        const char *p = s;
+        size_t c = 0;
+
+        /* Extract the i'nth line from the specified string. Returns > 0 if there are more lines after that,
+         * and == 0 if we are looking at the last line or already beyond the last line. As special
+         * optimization, if the first line is requested and the string only consists of one line we return
+         * NULL, indicating the input string should be used as is, and avoid a memory allocation for a very
+         * common case. */
+
+        for (;;) {
+                const char *q;
+
+                q = strchr(p, '\n');
+                if (i == c) {
+                        /* The line we are looking for! */
+
+                        if (q) {
+                                char *m;
+
+                                m = strndup(p, q - p);
+                                if (!m)
+                                        return -ENOMEM;
+
+                                *ret = m;
+                                return !isempty(q + 1); /* more coming? */
+                        } else {
+                                if (p == s)
+                                        *ret = NULL; /* Just use the input string */
+                                else {
+                                        char *m;
+
+                                        m = strdup(p);
+                                        if (!m)
+                                                return -ENOMEM;
+
+                                        *ret = m;
+                                }
+
+                                return 0; /* The end */
+                        }
+                }
+
+                if (!q) {
+                        char *m;
+
+                        /* No more lines, return empty line */
+
+                        m = strdup("");
+                        if (!m)
+                                return -ENOMEM;
+
+                        *ret = m;
+                        return 0; /* The end */
+                }
+
+                p = q + 1;
+                c++;
+        }
 }

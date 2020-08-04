@@ -31,7 +31,7 @@ __get_all_seats    () { loginctl --no-legend list-seats    | { while read -r a b
 
 __get_machines() {
     local a b
-    machinectl list --no-legend --no-pager 2>/dev/null |
+    machinectl list --full --no-legend --no-pager 2>/dev/null |
         { while read a b; do echo " $a"; done; };
 }
 
@@ -71,7 +71,6 @@ _loginctl () {
         COMPREPLY=( $(compgen -W '$comps' -- "$cur") )
         return 0
     fi
-
 
     if [[ "$cur" = -* ]]; then
         COMPREPLY=( $(compgen -W '${OPTS[*]}' -- "$cur") )

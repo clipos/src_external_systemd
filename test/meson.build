@@ -26,7 +26,7 @@ test_data_files = '''
         h.service
         hello-after-sleep.target
         hello.service
-        hwdb/10-bad.hwdb
+        hwdb.d/10-bad.hwdb
         i.service
         journal-data/journal-1.txt
         journal-data/journal-2.txt
@@ -102,13 +102,17 @@ test_data_files = '''
         test-execute/exec-privatedevices-no-capability-mknod.service
         test-execute/exec-privatedevices-no-capability-sys-rawio.service
         test-execute/exec-privatedevices-no.service
+        test-execute/exec-privatedevices-yes-with-group.service
         test-execute/exec-privatedevices-yes-capability-mknod.service
         test-execute/exec-privatedevices-yes-capability-sys-rawio.service
         test-execute/exec-privatedevices-yes.service
         test-execute/exec-privatenetwork-yes.service
         test-execute/exec-privatetmp-no.service
         test-execute/exec-privatetmp-yes.service
+        test-execute/exec-privatetmp-disabled-by-prefix.service
         test-execute/exec-protecthome-tmpfs-vs-protectsystem-strict.service
+        test-execute/exec-protectkernellogs-yes-capabilities.service
+        test-execute/exec-protectkernellogs-no-capabilities.service
         test-execute/exec-protectkernelmodules-no-capabilities.service
         test-execute/exec-protectkernelmodules-yes-capabilities.service
         test-execute/exec-protectkernelmodules-yes-mount-propagation.service
@@ -135,6 +139,7 @@ test_data_files = '''
         test-execute/exec-specifier@.service
         test-execute/exec-standardinput-data.service
         test-execute/exec-standardinput-file.service
+        test-execute/exec-standardinput-file-cat.service
         test-execute/exec-standardoutput-file.service
         test-execute/exec-standardoutput-append.service
         test-execute/exec-supplementarygroups-multiple-groups-default-group-user.service

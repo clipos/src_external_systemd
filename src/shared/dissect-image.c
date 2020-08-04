@@ -1,5 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
+#if HAVE_VALGRIND_MEMCHECK_H
+#include <valgrind/memcheck.h>
+#endif
+
 #include <linux/dm-ioctl.h>
 #include <linux/loop.h>
 #include <sys/mount.h>
@@ -24,11 +28,11 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
+#include "fsck-util.h"
 #include "gpt.h"
 #include "hexdecoct.h"
 #include "hostname-util.h"
 #include "id128-util.h"
-#include "missing.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "nulstr-util.h"
@@ -216,9 +220,15 @@ static int wait_for_partitions_to_appear(
                          * an explicit recognizable error about this, so that callers can generate a
                          * proper message explaining the situation. */
 
-                        if (ioctl(fd, LOOP_GET_STATUS64, &info) >= 0 && (info.lo_flags & LO_FLAGS_PARTSCAN) == 0) {
-                                log_debug("Device is a loop device and partition scanning is off!");
-                                return -EPROTONOSUPPORT;
+                        if (ioctl(fd, LOOP_GET_STATUS64, &info) >= 0) {
+#if HAVE_VALGRIND_MEMCHECK_H
+                                /* Valgrind currently doesn't know LOOP_GET_STATUS64. Remove this once it does */
+                                VALGRIND_MAKE_MEM_DEFINED(&info, sizeof(info));
+#endif
+
+                                if ((info.lo_flags & LO_FLAGS_PARTSCAN) == 0)
+                                        return log_debug_errno(EPROTONOSUPPORT,
+                                                               "Device is a loop device and partition scanning is off!");
                         }
                 }
                 if (r != -EBUSY)
@@ -267,6 +277,29 @@ static int loop_wait_for_partitions_to_appear(
         return log_debug_errno(SYNTHETIC_ERRNO(ENXIO),
                                "Kernel partitions dit not appear within %d attempts",
                                N_DEVICE_NODE_LIST_ATTEMPTS);
+}
+
+static void check_partition_flags(
+                const char *node,
+                unsigned long long pflags,
+                unsigned long long supported) {
+
+        assert(node);
+
+        /* Mask away all flags supported by this partition's type and the three flags the UEFI spec defines generically */
+        pflags &= ~(supported | GPT_FLAG_REQUIRED_PARTITION | GPT_FLAG_NO_BLOCK_IO_PROTOCOL | GPT_FLAG_LEGACY_BIOS_BOOTABLE);
+
+        if (pflags == 0)
+                return;
+
+        /* If there are other bits set, then log about it, to make things discoverable */
+        for (unsigned i = 0; i < sizeof(pflags) * 8; i++) {
+                unsigned long long bit = 1ULL << i;
+                if (!FLAGS_SET(pflags, bit))
+                        continue;
+
+                log_debug("Unexpected partition flag %llu set on %s!", bit, node);
+        }
 }
 
 #endif
@@ -392,10 +425,11 @@ int dissect_image(
 
                         m->encrypted = streq_ptr(fstype, "crypto_LUKS");
 
+                        /* Even on a single partition we need to wait for udev to create the
+                         * /dev/block/X:Y symlink to /dev/loopZ */
                         r = loop_wait_for_partitions_to_appear(fd, d, 0, flags, &e);
                         if (r < 0)
                                 return r;
-
                         *ret = TAKE_PTR(m);
 
                         return 0;
@@ -475,12 +509,16 @@ int dissect_image(
 
                         if (sd_id128_equal(type_id, GPT_HOME)) {
 
+                                check_partition_flags(node, pflags, GPT_FLAG_NO_AUTO|GPT_FLAG_READ_ONLY);
+
                                 if (pflags & GPT_FLAG_NO_AUTO)
                                         continue;
 
                                 designator = PARTITION_HOME;
                                 rw = !(pflags & GPT_FLAG_READ_ONLY);
                         } else if (sd_id128_equal(type_id, GPT_SRV)) {
+
+                                check_partition_flags(node, pflags, GPT_FLAG_NO_AUTO|GPT_FLAG_READ_ONLY);
 
                                 if (pflags & GPT_FLAG_NO_AUTO)
                                         continue;
@@ -501,6 +539,8 @@ int dissect_image(
 
                         } else if (sd_id128_equal(type_id, GPT_XBOOTLDR)) {
 
+                                check_partition_flags(node, pflags, GPT_FLAG_NO_AUTO|GPT_FLAG_READ_ONLY);
+
                                 if (pflags & GPT_FLAG_NO_AUTO)
                                         continue;
 
@@ -509,6 +549,8 @@ int dissect_image(
                         }
 #ifdef GPT_ROOT_NATIVE
                         else if (sd_id128_equal(type_id, GPT_ROOT_NATIVE)) {
+
+                                check_partition_flags(node, pflags, GPT_FLAG_NO_AUTO|GPT_FLAG_READ_ONLY);
 
                                 if (pflags & GPT_FLAG_NO_AUTO)
                                         continue;
@@ -521,6 +563,8 @@ int dissect_image(
                                 architecture = native_architecture();
                                 rw = !(pflags & GPT_FLAG_READ_ONLY);
                         } else if (sd_id128_equal(type_id, GPT_ROOT_NATIVE_VERITY)) {
+
+                                check_partition_flags(node, pflags, GPT_FLAG_NO_AUTO|GPT_FLAG_READ_ONLY);
 
                                 if (pflags & GPT_FLAG_NO_AUTO)
                                         continue;
@@ -540,6 +584,8 @@ int dissect_image(
 #ifdef GPT_ROOT_SECONDARY
                         else if (sd_id128_equal(type_id, GPT_ROOT_SECONDARY)) {
 
+                                check_partition_flags(node, pflags, GPT_FLAG_NO_AUTO|GPT_FLAG_READ_ONLY);
+
                                 if (pflags & GPT_FLAG_NO_AUTO)
                                         continue;
 
@@ -551,6 +597,8 @@ int dissect_image(
                                 architecture = SECONDARY_ARCHITECTURE;
                                 rw = !(pflags & GPT_FLAG_READ_ONLY);
                         } else if (sd_id128_equal(type_id, GPT_ROOT_SECONDARY_VERITY)) {
+
+                                check_partition_flags(node, pflags, GPT_FLAG_NO_AUTO|GPT_FLAG_READ_ONLY);
 
                                 if (pflags & GPT_FLAG_NO_AUTO)
                                         continue;
@@ -569,12 +617,16 @@ int dissect_image(
 #endif
                         else if (sd_id128_equal(type_id, GPT_SWAP)) {
 
+                                check_partition_flags(node, pflags, GPT_FLAG_NO_AUTO);
+
                                 if (pflags & GPT_FLAG_NO_AUTO)
                                         continue;
 
                                 designator = PARTITION_SWAP;
                                 fstype = "swap";
                         } else if (sd_id128_equal(type_id, GPT_LINUX_GENERIC)) {
+
+                                check_partition_flags(node, pflags, GPT_FLAG_NO_AUTO|GPT_FLAG_READ_ONLY);
 
                                 if (pflags & GPT_FLAG_NO_AUTO)
                                         continue;
@@ -589,6 +641,47 @@ int dissect_image(
                                         if (!generic_node)
                                                 return -ENOMEM;
                                 }
+
+                        } else if (sd_id128_equal(type_id, GPT_TMP)) {
+
+                                check_partition_flags(node, pflags, GPT_FLAG_NO_AUTO|GPT_FLAG_READ_ONLY);
+
+                                if (pflags & GPT_FLAG_NO_AUTO)
+                                        continue;
+
+                                designator = PARTITION_TMP;
+                                rw = !(pflags & GPT_FLAG_READ_ONLY);
+
+                        } else if (sd_id128_equal(type_id, GPT_VAR)) {
+
+                                check_partition_flags(node, pflags, GPT_FLAG_NO_AUTO|GPT_FLAG_READ_ONLY);
+
+                                if (pflags & GPT_FLAG_NO_AUTO)
+                                        continue;
+
+                                if (!FLAGS_SET(flags, DISSECT_IMAGE_RELAX_VAR_CHECK)) {
+                                        sd_id128_t var_uuid;
+
+                                        /* For /var we insist that the uuid of the partition matches the
+                                         * HMAC-SHA256 of the /var GPT partition type uuid, keyed by machine
+                                         * ID. Why? Unlike the other partitions /var is inherently
+                                         * installation specific, hence we need to be careful not to mount it
+                                         * in the wrong installation. By hashing the partition UUID from
+                                         * /etc/machine-id we can securely bind the partition to the
+                                         * installation. */
+
+                                        r = sd_id128_get_machine_app_specific(GPT_VAR, &var_uuid);
+                                        if (r < 0)
+                                                return r;
+
+                                        if (!sd_id128_equal(var_uuid, id)) {
+                                                log_debug("Found a /var/ partition, but its UUID didn't match our expectations, ignoring.");
+                                                continue;
+                                        }
+                                }
+
+                                designator = PARTITION_VAR;
+                                rw = !(pflags & GPT_FLAG_READ_ONLY);
                         }
 
                         if (designator != _PARTITION_DESIGNATOR_INVALID) {
@@ -805,6 +898,49 @@ static int is_loop_device(const char *path) {
         return true;
 }
 
+static int run_fsck(const char *node, const char *fstype) {
+        int r, exit_status;
+        pid_t pid;
+
+        assert(node);
+        assert(fstype);
+
+        r = fsck_exists(fstype);
+        if (r < 0) {
+                log_debug_errno(r, "Couldn't determine whether fsck for %s exists, proceeding anyway.", fstype);
+                return 0;
+        }
+        if (r == 0) {
+                log_debug("Not checking partition %s, as fsck for %s does not exist.", node, fstype);
+                return 0;
+        }
+
+        r = safe_fork("(fsck)", FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_RLIMIT_NOFILE_SAFE|FORK_DEATHSIG|FORK_NULL_STDIO, &pid);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to fork off fsck: %m");
+        if (r == 0) {
+                /* Child */
+                execl("/sbin/fsck", "/sbin/fsck", "-aT", node, NULL);
+                log_debug_errno(errno, "Failed to execl() fsck: %m");
+                _exit(FSCK_OPERATIONAL_ERROR);
+        }
+
+        exit_status = wait_for_terminate_and_check("fsck", pid, 0);
+        if (exit_status < 0)
+                return log_debug_errno(exit_status, "Failed to fork off /sbin/fsck: %m");
+
+        if ((exit_status & ~FSCK_ERROR_CORRECTED) != FSCK_SUCCESS) {
+                log_debug("fsck failed with exit status %i.", exit_status);
+
+                if ((exit_status & (FSCK_SYSTEM_SHOULD_REBOOT|FSCK_ERRORS_LEFT_UNCORRECTED)) != 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EUCLEAN), "File system is corrupted, refusing.");
+
+                log_debug("Ignoring fsck error.");
+        }
+
+        return 0;
+}
+
 static int mount_partition(
                 DissectedPartition *m,
                 const char *where,
@@ -832,8 +968,14 @@ static int mount_partition(
 
         rw = m->rw && !(flags & DISSECT_IMAGE_READ_ONLY);
 
+        if (FLAGS_SET(flags, DISSECT_IMAGE_FSCK) && rw) {
+                r = run_fsck(node, fstype);
+                if (r < 0)
+                        return r;
+        }
+
         if (directory) {
-                r = chase_symlinks(directory, where, CHASE_PREFIX_ROOT, &chased);
+                r = chase_symlinks(directory, where, CHASE_PREFIX_ROOT, &chased, NULL);
                 if (r < 0)
                         return r;
 
@@ -901,6 +1043,14 @@ int dissected_image_mount(DissectedImage *m, const char *where, uid_t uid_shift,
         if (r < 0)
                 return r;
 
+        r = mount_partition(m->partitions + PARTITION_VAR, where, "/var", uid_shift, flags);
+        if (r < 0)
+                return r;
+
+        r = mount_partition(m->partitions + PARTITION_TMP, where, "/var/tmp", uid_shift, flags);
+        if (r < 0)
+                return r;
+
         boot_mounted = mount_partition(m->partitions + PARTITION_XBOOTLDR, where, "/boot", uid_shift, flags);
         if (boot_mounted < 0)
                 return boot_mounted;
@@ -909,7 +1059,7 @@ int dissected_image_mount(DissectedImage *m, const char *where, uid_t uid_shift,
                 /* Mount the ESP to /efi if it exists. If it doesn't exist, use /boot instead, but only if it
                  * exists and is empty, and we didn't already mount the XBOOTLDR partition into it. */
 
-                r = chase_symlinks("/efi", where, CHASE_PREFIX_ROOT, NULL);
+                r = chase_symlinks("/efi", where, CHASE_PREFIX_ROOT, NULL, NULL);
                 if (r >= 0) {
                         r = mount_partition(m->partitions + PARTITION_ESP, where, "/efi", uid_shift, flags);
                         if (r < 0)
@@ -918,7 +1068,7 @@ int dissected_image_mount(DissectedImage *m, const char *where, uid_t uid_shift,
                 } else if (boot_mounted <= 0) {
                         _cleanup_free_ char *p = NULL;
 
-                        r = chase_symlinks("/boot", where, CHASE_PREFIX_ROOT, &p);
+                        r = chase_symlinks("/boot", where, CHASE_PREFIX_ROOT, &p, NULL);
                         if (r >= 0 && dir_is_empty(p) > 0) {
                                 r = mount_partition(m->partitions + PARTITION_ESP, where, "/boot", uid_shift, flags);
                                 if (r < 0)
@@ -1038,6 +1188,8 @@ static int decrypt_partition(
         if (r < 0)
                 return log_debug_errno(r, "Failed to initialize dm-crypt: %m");
 
+        crypt_set_log_callback(cd, cryptsetup_log_glue, NULL);
+
         r = crypt_load(cd, CRYPT_LUKS, NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to load LUKS metadata: %m");
@@ -1095,6 +1247,8 @@ static int verity_partition(
         r = crypt_init(&cd, v->node);
         if (r < 0)
                 return r;
+
+        crypt_set_log_callback(cd, cryptsetup_log_glue, NULL);
 
         r = crypt_load(cd, CRYPT_VERITY, NULL);
         if (r < 0)
@@ -1324,7 +1478,8 @@ int dissected_image_acquire_metadata(DissectedImage *m) {
                 [META_HOSTNAME]     = "/etc/hostname\0",
                 [META_MACHINE_ID]   = "/etc/machine-id\0",
                 [META_MACHINE_INFO] = "/etc/machine-info\0",
-                [META_OS_RELEASE]   = "/etc/os-release\0/usr/lib/os-release\0",
+                [META_OS_RELEASE]   = "/etc/os-release\0"
+                                      "/usr/lib/os-release\0",
         };
 
         _cleanup_strv_free_ char **machine_info = NULL, **os_release = NULL;
@@ -1519,6 +1674,8 @@ static const char *const partition_designator_table[] = {
         [PARTITION_SWAP] = "swap",
         [PARTITION_ROOT_VERITY] = "root-verity",
         [PARTITION_ROOT_SECONDARY_VERITY] = "root-secondary-verity",
+        [PARTITION_TMP] = "tmp",
+        [PARTITION_VAR] = "var",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(partition_designator, int);

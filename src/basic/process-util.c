@@ -4,11 +4,9 @@
 #include <errno.h>
 #include <limits.h>
 #include <linux/oom.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/personality.h>
@@ -23,8 +21,9 @@
 
 #include "alloc-util.h"
 #include "architecture.h"
-#include "escape.h"
 #include "env-util.h"
+#include "errno-util.h"
+#include "escape.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
@@ -33,13 +32,16 @@
 #include "log.h"
 #include "macro.h"
 #include "memory-util.h"
-#include "missing.h"
+#include "missing_sched.h"
+#include "missing_syscall.h"
 #include "namespace-util.h"
+#include "path-util.h"
 #include "process-util.h"
 #include "raw-clone.h"
 #include "rlimit-util.h"
 #include "signal-util.h"
 #include "stat-util.h"
+#include "stdio-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "terminal-util.h"
@@ -52,12 +54,16 @@
 #define COMM_MAX_LEN 128
 
 static int get_process_state(pid_t pid) {
+        _cleanup_free_ char *line = NULL;
         const char *p;
         char state;
         int r;
-        _cleanup_free_ char *line = NULL;
 
         assert(pid >= 0);
+
+        /* Shortcut: if we are enquired about our own state, we are obviously running */
+        if (pid == 0 || pid == getpid_cached())
+                return (unsigned char) 'R';
 
         p = procfs_file_alloca(pid, "stat");
 
@@ -81,23 +87,34 @@ static int get_process_state(pid_t pid) {
 
 int get_process_comm(pid_t pid, char **ret) {
         _cleanup_free_ char *escaped = NULL, *comm = NULL;
-        const char *p;
         int r;
 
         assert(ret);
         assert(pid >= 0);
 
+        if (pid == 0 || pid == getpid_cached()) {
+                comm = new0(char, TASK_COMM_LEN + 1); /* Must fit in 16 byte according to prctl(2) */
+                if (!comm)
+                        return -ENOMEM;
+
+                if (prctl(PR_GET_NAME, comm) < 0)
+                        return -errno;
+        } else {
+                const char *p;
+
+                p = procfs_file_alloca(pid, "comm");
+
+                /* Note that process names of kernel threads can be much longer than TASK_COMM_LEN */
+                r = read_one_line_file(p, &comm);
+                if (r == -ENOENT)
+                        return -ESRCH;
+                if (r < 0)
+                        return r;
+        }
+
         escaped = new(char, COMM_MAX_LEN);
         if (!escaped)
                 return -ENOMEM;
-
-        p = procfs_file_alloca(pid, "comm");
-
-        r = read_one_line_file(p, &comm);
-        if (r == -ENOENT)
-                return -ESRCH;
-        if (r < 0)
-                return r;
 
         /* Escape unprintable characters, just in case, but don't grow the string beyond the underlying size */
         cellescape(escaped, COMM_MAX_LEN, comm);
@@ -500,6 +517,9 @@ int get_process_cwd(pid_t pid, char **cwd) {
         const char *p;
 
         assert(pid >= 0);
+
+        if (pid == 0 || pid == getpid_cached())
+                return safe_getcwd(cwd);
 
         p = procfs_file_alloca(pid, "cwd");
 
@@ -1245,8 +1265,8 @@ int safe_fork_full(
                                        r, "Failed to rename process, ignoring: %m");
         }
 
-        if (flags & FORK_DEATHSIG)
-                if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0) {
+        if (flags & (FORK_DEATHSIG|FORK_DEATHSIG_SIGINT))
+                if (prctl(PR_SET_PDEATHSIG, (flags & FORK_DEATHSIG_SIGINT) ? SIGINT : SIGTERM) < 0) {
                         log_full_errno(prio, errno, "Failed to set death signal: %m");
                         _exit(EXIT_FAILURE);
                 }
@@ -1317,6 +1337,12 @@ int safe_fork_full(
                 r = make_null_stdio();
                 if (r < 0) {
                         log_full_errno(prio, r, "Failed to connect stdin/stdout to /dev/null: %m");
+                        _exit(EXIT_FAILURE);
+                }
+
+        } else if (flags & FORK_STDOUT_TO_STDERR) {
+                if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0) {
+                        log_full_errno(prio, errno, "Failed to connect stdout to stderr: %m");
                         _exit(EXIT_FAILURE);
                 }
         }
@@ -1468,6 +1494,94 @@ int set_oom_score_adjust(int value) {
 
         return write_string_file("/proc/self/oom_score_adj", t,
                                  WRITE_STRING_FILE_VERIFY_ON_FAILURE|WRITE_STRING_FILE_DISABLE_BUFFER);
+}
+
+int pidfd_get_pid(int fd, pid_t *ret) {
+        char path[STRLEN("/proc/self/fdinfo/") + DECIMAL_STR_MAX(int)];
+        _cleanup_free_ char *fdinfo = NULL;
+        char *p;
+        int r;
+
+        if (fd < 0)
+                return -EBADF;
+
+        xsprintf(path, "/proc/self/fdinfo/%i", fd);
+
+        r = read_full_file(path, &fdinfo, NULL);
+        if (r == -ENOENT) /* if fdinfo doesn't exist we assume the process does not exist */
+                return -ESRCH;
+        if (r < 0)
+                return r;
+
+        p = startswith(fdinfo, "Pid:");
+        if (!p) {
+                p = strstr(fdinfo, "\nPid:");
+                if (!p)
+                        return -ENOTTY; /* not a pidfd? */
+
+                p += 5;
+        }
+
+        p += strspn(p, WHITESPACE);
+        p[strcspn(p, WHITESPACE)] = 0;
+
+        return parse_pid(p, ret);
+}
+
+static int rlimit_to_nice(rlim_t limit) {
+        if (limit <= 1)
+                return PRIO_MAX-1; /* i.e. 19 */
+
+        if (limit >= -PRIO_MIN + PRIO_MAX)
+                return PRIO_MIN; /* i.e. -20 */
+
+        return PRIO_MAX - (int) limit;
+}
+
+int setpriority_closest(int priority) {
+        int current, limit, saved_errno;
+        struct rlimit highest;
+
+        /* Try to set requested nice level */
+        if (setpriority(PRIO_PROCESS, 0, priority) >= 0)
+                return 1;
+
+        /* Permission failed */
+        saved_errno = -errno;
+        if (!ERRNO_IS_PRIVILEGE(saved_errno))
+                return saved_errno;
+
+        errno = 0;
+        current = getpriority(PRIO_PROCESS, 0);
+        if (errno != 0)
+                return -errno;
+
+        if (priority == current)
+                return 1;
+
+       /* Hmm, we'd expect that raising the nice level from our status quo would always work. If it doesn't,
+        * then the whole setpriority() system call is blocked to us, hence let's propagate the error
+        * right-away */
+        if (priority > current)
+                return saved_errno;
+
+        if (getrlimit(RLIMIT_NICE, &highest) < 0)
+                return -errno;
+
+        limit = rlimit_to_nice(highest.rlim_cur);
+
+        /* We are already less nice than limit allows us */
+        if (current < limit) {
+                log_debug("Cannot raise nice level, permissions and the resource limit do not allow it.");
+                return 0;
+        }
+
+        /* Push to the allowed limit */
+        if (setpriority(PRIO_PROCESS, 0, limit) < 0)
+                return -errno;
+
+        log_debug("Cannot set requested nice level (%i), used next best (%i).", priority, limit);
+        return 0;
 }
 
 static const char *const ioprio_class_table[] = {

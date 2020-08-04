@@ -146,7 +146,7 @@ int device_set_syspath(sd_device *device, const char *_syspath, bool verify) {
                                        _syspath);
 
         if (verify) {
-                r = chase_symlinks(_syspath, NULL, 0, &syspath);
+                r = chase_symlinks(_syspath, NULL, 0, &syspath, NULL);
                 if (r == -ENOENT)
                         return -ENODEV; /* the device does not exist (any more?) */
                 if (r < 0)
@@ -157,7 +157,7 @@ int device_set_syspath(sd_device *device, const char *_syspath, bool verify) {
                         char *p;
 
                         /* /sys is a symlink to somewhere sysfs is mounted on? In that case, we convert the path to real sysfs to "/sys". */
-                        r = chase_symlinks("/sys", NULL, 0, &real_sys);
+                        r = chase_symlinks("/sys", NULL, 0, &real_sys, NULL);
                         if (r < 0)
                                 return log_debug_errno(r, "sd-device: Failed to chase symlink /sys: %m");
 
@@ -340,17 +340,17 @@ int device_set_devtype(sd_device *device, const char *_devtype) {
         return 0;
 }
 
-int device_set_ifindex(sd_device *device, const char *_ifindex) {
-        int ifindex, r;
+int device_set_ifindex(sd_device *device, const char *name) {
+        int r, ifindex;
 
         assert(device);
-        assert(_ifindex);
+        assert(name);
 
-        r = parse_ifindex(_ifindex, &ifindex);
-        if (r < 0)
-                return r;
+        ifindex = parse_ifindex(name);
+        if (ifindex < 0)
+                return ifindex;
 
-        r = device_add_property_internal(device, "IFINDEX", _ifindex);
+        r = device_add_property_internal(device, "IFINDEX", name);
         if (r < 0)
                 return r;
 
@@ -619,7 +619,7 @@ _public_ int sd_device_new_from_device_id(sd_device **ret, const char *id) {
                 struct ifreq ifr = {};
                 int ifindex;
 
-                r = parse_ifindex(&id[1], &ifr.ifr_ifindex);
+                r = ifr.ifr_ifindex = parse_ifindex(&id[1]);
                 if (r < 0)
                         return r;
 
@@ -1786,7 +1786,7 @@ _public_ int sd_device_get_sysattr_value(sd_device *device, const char *sysattr,
                 size_t size;
 
                 /* read attribute value */
-                r = read_full_file(path, &value, &size);
+                r = read_full_virtual_file(path, &value, &size);
                 if (r < 0)
                         return r;
 

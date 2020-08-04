@@ -40,7 +40,7 @@
     are configured in the <literal>[Automount]</literal> section.</para>
 
     <para>Automount units must be named after the automount directories they control. Example: the automount point
-    <filename noindex='true'>/home/lennart</filename> must be configured in a unit file
+    <filename index="false">/home/lennart</filename> must be configured in a unit file
     <filename>home-lennart.automount</filename>. For details about the escaping logic used to convert a file system
     path to a unit name see
     <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>. Note that
@@ -57,6 +57,12 @@
 
     <para>Automount units may be used to implement on-demand mounting
     as well as parallelized mounting of file systems.</para>
+
+    <para>Note that automount units are separate from the mount itself, so you
+    should not set <varname>After=</varname> or <varname>Requires=</varname>
+    for mount dependencies here. For example, you should not set
+    <varname>After=network-online.target</varname> or similar on network
+    filesystems. Doing so may result in an ordering cycle.</para>
   </refsect1>
 
   <refsect1>
@@ -86,6 +92,10 @@
         <listitem><para>Automount units acquire automatic <varname>Before=</varname> and
         <varname>Conflicts=</varname> on <filename>umount.target</filename> in order to be stopped during
         shutdown.</para></listitem>
+
+        <listitem><para>Automount units automatically gain an <varname>After=</varname> dependency
+        on <filename>local-fs-pre.target</filename>, and a <varname>Before=</varname> dependency on
+        <filename>local-fs.target</filename>.</para></listitem>
       </itemizedlist>
     </refsect2>
   </refsect1>

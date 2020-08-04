@@ -13,6 +13,7 @@ typedef enum UnitNameFlags {
         UNIT_NAME_TEMPLATE = 1 << 1, /* Allow foo@.service */
         UNIT_NAME_INSTANCE = 1 << 2, /* Allow foo@bar.service */
         UNIT_NAME_ANY = UNIT_NAME_PLAIN|UNIT_NAME_TEMPLATE|UNIT_NAME_INSTANCE,
+        _UNIT_NAME_INVALID = -1,
 } UnitNameFlags;
 
 bool unit_name_is_valid(const char *n, UnitNameFlags flags) _pure_;
@@ -52,10 +53,10 @@ typedef enum UnitNameMangle {
         UNIT_NAME_MANGLE_WARN = 1 << 1,
 } UnitNameMangle;
 
-int unit_name_mangle_with_suffix(const char *name, UnitNameMangle flags, const char *suffix, char **ret);
+int unit_name_mangle_with_suffix(const char *name, const char *operation, UnitNameMangle flags, const char *suffix, char **ret);
 
 static inline int unit_name_mangle(const char *name, UnitNameMangle flags, char **ret) {
-        return unit_name_mangle_with_suffix(name, flags, ".service", ret);
+        return unit_name_mangle_with_suffix(name, NULL, flags, ".service", ret);
 }
 
 int slice_build_parent_slice(const char *slice, char **ret);

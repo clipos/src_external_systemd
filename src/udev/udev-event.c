@@ -5,7 +5,6 @@
 #include <fcntl.h>
 #include <net/if.h>
 #include <stddef.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -370,7 +369,7 @@ static ssize_t udev_event_subst_format(
         }
         case FORMAT_SUBST_PARENT:
                 r = sd_device_get_parent(dev, &parent);
-                if (r == -ENODEV)
+                if (r == -ENOENT)
                         goto null_terminate;
                 if (r < 0)
                         return r;
@@ -437,9 +436,9 @@ null_terminate:
         return 0;
 }
 
-ssize_t udev_event_apply_format(UdevEvent *event,
-                                const char *src, char *dest, size_t size,
-                                bool replace_whitespace) {
+size_t udev_event_apply_format(UdevEvent *event,
+                               const char *src, char *dest, size_t size,
+                               bool replace_whitespace) {
         const char *s = src;
         int r;
 
@@ -455,9 +454,10 @@ ssize_t udev_event_apply_format(UdevEvent *event,
                 ssize_t subst_len;
 
                 r = get_subst_type(&s, false, &type, attr);
-                if (r < 0)
-                        return log_device_warning_errno(event->dev, r, "Invalid format string, ignoring: %s", src);
-                if (r == 0) {
+                if (r < 0) {
+                        log_device_warning_errno(event->dev, r, "Invalid format string, ignoring: %s", src);
+                        break;
+                } else if (r == 0) {
                         if (size < 2) /* need space for this char and the terminating NUL */
                                 break;
                         *dest++ = *s++;
@@ -466,10 +466,12 @@ ssize_t udev_event_apply_format(UdevEvent *event,
                 }
 
                 subst_len = udev_event_subst_format(event, type, attr, dest, size);
-                if (subst_len < 0)
-                        return log_device_warning_errno(event->dev, subst_len,
-                                                        "Failed to substitute variable '$%s' or apply format '%%%c', ignoring: %m",
-                                                        format_type_to_string(type), format_type_to_char(type));
+                if (subst_len < 0) {
+                        log_device_warning_errno(event->dev, subst_len,
+                                                 "Failed to substitute variable '$%s' or apply format '%%%c', ignoring: %m",
+                                                 format_type_to_string(type), format_type_to_char(type));
+                        break;
+                }
 
                 /* FORMAT_SUBST_RESULT handles spaces itself */
                 if (replace_whitespace && type != FORMAT_SUBST_RESULT)
@@ -535,6 +537,7 @@ static int on_spawn_io(sd_event_source *s, int fd, uint32_t revents, void *userd
         char buf[4096], *p;
         size_t size;
         ssize_t l;
+        int r;
 
         assert(spawn);
         assert(fd == spawn->fd_stdout || fd == spawn->fd_stderr);
@@ -550,9 +553,11 @@ static int on_spawn_io(sd_event_source *s, int fd, uint32_t revents, void *userd
 
         l = read(fd, p, size - 1);
         if (l < 0) {
-                if (errno != EAGAIN)
-                        log_device_error_errno(spawn->device, errno,
-                                               "Failed to read stdout of '%s': %m", spawn->cmd);
+                if (errno == EAGAIN)
+                        goto reenable;
+
+                log_device_error_errno(spawn->device, errno,
+                                       "Failed to read stdout of '%s': %m", spawn->cmd);
 
                 return 0;
         }
@@ -575,6 +580,16 @@ static int on_spawn_io(sd_event_source *s, int fd, uint32_t revents, void *userd
                                          fd == spawn->fd_stdout ? "out" : "err", *q);
         }
 
+
+        if (l == 0)
+                return 0;
+
+        /* Re-enable the event source if we did not encounter EOF */
+reenable:
+        r = sd_event_source_set_enabled(s, SD_EVENT_ONESHOT);
+        if (r < 0)
+                log_device_error_errno(spawn->device, r,
+                                       "Failed to reactivate IO source of '%s'", spawn->cmd);
         return 0;
 }
 
@@ -635,6 +650,9 @@ static int on_spawn_sigchld(sd_event_source *s, const siginfo_t *si, void *userd
 
 static int spawn_wait(Spawn *spawn) {
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_event_source_unrefp) sd_event_source *sigchld_source = NULL;
+        _cleanup_(sd_event_source_unrefp) sd_event_source *stdout_source = NULL;
+        _cleanup_(sd_event_source_unrefp) sd_event_source *stderr_source = NULL;
         int r;
 
         assert(spawn);
@@ -671,20 +689,31 @@ static int spawn_wait(Spawn *spawn) {
         }
 
         if (spawn->fd_stdout >= 0) {
-                r = sd_event_add_io(e, NULL, spawn->fd_stdout, EPOLLIN, on_spawn_io, spawn);
+                r = sd_event_add_io(e, &stdout_source, spawn->fd_stdout, EPOLLIN, on_spawn_io, spawn);
+                if (r < 0)
+                        return r;
+                r = sd_event_source_set_enabled(stdout_source, SD_EVENT_ONESHOT);
                 if (r < 0)
                         return r;
         }
 
         if (spawn->fd_stderr >= 0) {
-                r = sd_event_add_io(e, NULL, spawn->fd_stderr, EPOLLIN, on_spawn_io, spawn);
+                r = sd_event_add_io(e, &stderr_source, spawn->fd_stderr, EPOLLIN, on_spawn_io, spawn);
+                if (r < 0)
+                        return r;
+                r = sd_event_source_set_enabled(stderr_source, SD_EVENT_ONESHOT);
                 if (r < 0)
                         return r;
         }
 
-        r = sd_event_add_child(e, NULL, spawn->pid, WEXITED, on_spawn_sigchld, spawn);
+        r = sd_event_add_child(e, &sigchld_source, spawn->pid, WEXITED, on_spawn_sigchld, spawn);
         if (r < 0)
                 return r;
+        /* SIGCHLD should be processed after IO is complete */
+        r = sd_event_source_set_priority(sigchld_source, SD_EVENT_PRIORITY_NORMAL + 1);
+        if (r < 0)
+                return r;
+
 
         return sd_event_loop(e);
 }
@@ -1015,7 +1044,9 @@ void udev_event_execute_run(UdevEvent *event, usec_t timeout_usec) {
 
                         log_device_debug(event->dev, "Running command \"%s\"", command);
                         r = udev_event_spawn(event, timeout_usec, false, command, NULL, 0);
-                        if (r > 0) /* returned value is positive when program fails */
+                        if (r < 0)
+                                log_device_warning_errno(event->dev, r, "Failed to execute '%s', ignoring: %m", command);
+                        else if (r > 0) /* returned value is positive when program fails */
                                 log_device_debug(event->dev, "Command \"%s\" returned %d (error), ignoring.", command, r);
                 }
         }

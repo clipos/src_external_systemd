@@ -11,13 +11,11 @@
 #include "hexdecoct.h"
 #include "macsec.h"
 #include "memory-util.h"
-#include "missing.h"
 #include "netlink-util.h"
 #include "network-internal.h"
 #include "networkd-address.h"
 #include "networkd-manager.h"
 #include "path-util.h"
-#include "sd-netlink.h"
 #include "socket-util.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -104,7 +102,7 @@ static void macsec_receive_channel_free(ReceiveChannel *c) {
 
         if (c->macsec) {
                 if (c->sci.as_uint64 > 0)
-                        ordered_hashmap_remove(c->macsec->receive_channels, &c->sci.as_uint64);
+                        ordered_hashmap_remove_value(c->macsec->receive_channels, &c->sci.as_uint64, c);
 
                 if (c->section)
                         ordered_hashmap_remove(c->macsec->receive_channels_by_section, c->section);
@@ -830,7 +828,7 @@ int config_parse_macsec_key_id(
 
         _cleanup_(macsec_transmit_association_free_or_set_invalidp) TransmitAssociation *a = NULL;
         _cleanup_(macsec_receive_association_free_or_set_invalidp) ReceiveAssociation *b = NULL;
-        _cleanup_free_ void *p;
+        _cleanup_free_ void *p = NULL;
         MACsec *s = userdata;
         uint8_t *dest;
         size_t l;
@@ -981,7 +979,9 @@ static int macsec_read_key_file(NetDev *netdev, SecurityAssociation *sa) {
         if (!sa->key_file)
                 return 0;
 
-        r = read_full_file_full(sa->key_file, READ_FULL_FILE_SECURE | READ_FULL_FILE_UNHEX, (char **) &key, &key_len);
+        (void) warn_file_is_world_accessible(sa->key_file, NULL, NULL, 0);
+
+        r = read_full_file_full(AT_FDCWD, sa->key_file, READ_FULL_FILE_SECURE | READ_FULL_FILE_UNHEX, (char **) &key, &key_len);
         if (r < 0)
                 return log_netdev_error_errno(netdev, r,
                                               "Failed to read key from '%s', ignoring: %m",
@@ -1235,7 +1235,7 @@ static void macsec_done(NetDev *netdev) {
 const NetDevVTable macsec_vtable = {
         .object_size = sizeof(MACsec),
         .init = macsec_init,
-        .sections = "Match\0NetDev\0MACsec\0MACsecReceiveChannel\0MACsecTransmitAssociation\0MACsecReceiveAssociation\0",
+        .sections = NETDEV_COMMON_SECTIONS "MACsec\0MACsecReceiveChannel\0MACsecTransmitAssociation\0MACsecReceiveAssociation\0",
         .fill_message_create = netdev_macsec_fill_message_create,
         .post_create = netdev_macsec_configure,
         .done = macsec_done,

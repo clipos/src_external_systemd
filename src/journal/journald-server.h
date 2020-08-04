@@ -60,6 +60,8 @@ typedef struct JournalStorage {
 } JournalStorage;
 
 struct Server {
+        char *namespace;
+
         int syslog_fd;
         int native_fd;
         int stdout_fd;
@@ -84,6 +86,7 @@ struct Server {
         sd_event_source *hostname_event_source;
         sd_event_source *notify_event_source;
         sd_event_source *watchdog_event_source;
+        sd_event_source *idle_event_source;
 
         JournalFile *runtime_journal;
         JournalFile *system_journal;
@@ -94,10 +97,10 @@ struct Server {
         char *buffer;
         size_t buffer_size;
 
-        JournalRateLimit *rate_limit;
+        JournalRateLimit *ratelimit;
         usec_t sync_interval_usec;
-        usec_t rate_limit_interval;
-        unsigned rate_limit_burst;
+        usec_t ratelimit_interval;
+        unsigned ratelimit_burst;
 
         JournalStorage runtime_storage;
         JournalStorage system_storage;
@@ -105,6 +108,7 @@ struct Server {
         JournalCompressOptions compress;
         bool seal;
         bool read_kmsg;
+        int set_audit;
 
         bool forward_to_kmsg;
         bool forward_to_syslog;
@@ -113,8 +117,6 @@ struct Server {
 
         unsigned n_forward_syslog_missed;
         usec_t last_warn_forward_syslog_missed;
-
-        uint64_t var_available_timestamp;
 
         usec_t max_retention_usec;
         usec_t max_file_usec;
@@ -149,6 +151,8 @@ struct Server {
         char machine_id_field[sizeof("_MACHINE_ID=") + 32];
         char boot_id_field[sizeof("_BOOT_ID=") + 32];
         char *hostname_field;
+        char *namespace_field;
+        char *runtime_directory;
 
         /* Cached cgroup root, so that we don't have to query that all the time */
         char *cgroup_root;
@@ -174,7 +178,7 @@ struct Server {
 #define SERVER_MACHINE_ID(s) ((s)->machine_id_field + STRLEN("_MACHINE_ID="))
 
 /* Extra fields for any log messages */
-#define N_IOVEC_META_FIELDS 22
+#define N_IOVEC_META_FIELDS 23
 
 /* Extra fields for log messages that contain OBJECT_PID= (i.e. log about another process) */
 #define N_IOVEC_OBJECT_FIELDS 18
@@ -206,7 +210,7 @@ CONFIG_PARSER_PROTOTYPE(config_parse_split_mode);
 const char *split_mode_to_string(SplitMode s) _const_;
 SplitMode split_mode_from_string(const char *s) _pure_;
 
-int server_init(Server *s);
+int server_init(Server *s, const char *namespace);
 void server_done(Server *s);
 void server_sync(Server *s);
 int server_vacuum(Server *s, bool verbose);
@@ -216,3 +220,6 @@ int server_flush_to_var(Server *s, bool require_flag_file);
 void server_maybe_append_tags(Server *s);
 int server_process_datagram(sd_event_source *es, int fd, uint32_t revents, void *userdata);
 void server_space_usage_message(Server *s, JournalStorage *storage);
+
+int server_start_or_stop_idle_timer(Server *s);
+int server_refresh_idle_timer(Server *s);

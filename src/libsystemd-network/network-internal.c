@@ -8,6 +8,7 @@
 #include "sd-ndisc.h"
 
 #include "alloc-util.h"
+#include "arphrd-list.h"
 #include "condition.h"
 #include "conf-parser.h"
 #include "device-util.h"
@@ -20,6 +21,7 @@
 #include "parse-util.h"
 #include "siphash24.h"
 #include "socket-util.h"
+#include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
 #include "utf8.h"
@@ -102,6 +104,18 @@ static bool net_condition_test_strv(char * const *patterns, const char *string) 
         return has_positive_rule ? match : true;
 }
 
+static bool net_condition_test_ifname(char * const *patterns, const char *ifname, char * const *alternative_names) {
+        if (net_condition_test_strv(patterns, ifname))
+                return true;
+
+        char * const *p;
+        STRV_FOREACH(p, alternative_names)
+                if (net_condition_test_strv(patterns, *p))
+                        return true;
+
+        return false;
+}
+
 static int net_condition_test_property(char * const *match_property, sd_device *device) {
         char * const *p;
 
@@ -136,23 +150,76 @@ static int net_condition_test_property(char * const *match_property, sd_device *
         return true;
 }
 
+static const char *const wifi_iftype_table[NL80211_IFTYPE_MAX+1] = {
+        [NL80211_IFTYPE_ADHOC] = "ad-hoc",
+        [NL80211_IFTYPE_STATION] = "station",
+        [NL80211_IFTYPE_AP] = "ap",
+        [NL80211_IFTYPE_AP_VLAN] = "ap-vlan",
+        [NL80211_IFTYPE_WDS] = "wds",
+        [NL80211_IFTYPE_MONITOR] = "monitor",
+        [NL80211_IFTYPE_MESH_POINT] = "mesh-point",
+        [NL80211_IFTYPE_P2P_CLIENT] = "p2p-client",
+        [NL80211_IFTYPE_P2P_GO] = "p2p-go",
+        [NL80211_IFTYPE_P2P_DEVICE] = "p2p-device",
+        [NL80211_IFTYPE_OCB] = "ocb",
+        [NL80211_IFTYPE_NAN] = "nan",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(wifi_iftype, enum nl80211_iftype);
+
+char *link_get_type_string(unsigned short iftype, sd_device *device) {
+        const char *t, *devtype;
+        char *p;
+
+        if (device &&
+            sd_device_get_devtype(device, &devtype) >= 0 &&
+            !isempty(devtype))
+                return strdup(devtype);
+
+        t = arphrd_to_name(iftype);
+        if (!t)
+                return NULL;
+
+        p = strdup(t);
+        if (!p)
+                return NULL;
+
+        ascii_strlower(p);
+        return p;
+}
+
 bool net_match_config(Set *match_mac,
+                      Set *match_permanent_mac,
                       char * const *match_paths,
                       char * const *match_drivers,
-                      char * const *match_types,
+                      char * const *match_iftypes,
                       char * const *match_names,
                       char * const *match_property,
+                      char * const *match_wifi_iftype,
+                      char * const *match_ssid,
+                      Set *match_bssid,
                       sd_device *device,
                       const struct ether_addr *dev_mac,
-                      const char *dev_name) {
+                      const struct ether_addr *dev_permanent_mac,
+                      const char *dev_driver,
+                      unsigned short dev_iftype,
+                      const char *dev_name,
+                      char * const *alternative_names,
+                      enum nl80211_iftype dev_wifi_iftype,
+                      const char *dev_ssid,
+                      const struct ether_addr *dev_bssid) {
 
-        const char *dev_path = NULL, *dev_driver = NULL, *dev_type = NULL, *mac_str;
+        _cleanup_free_ char *dev_iftype_str;
+        const char *dev_path = NULL;
+
+        dev_iftype_str = link_get_type_string(dev_iftype, device);
 
         if (device) {
-                (void) sd_device_get_property_value(device, "ID_PATH", &dev_path);
-                (void) sd_device_get_property_value(device, "ID_NET_DRIVER", &dev_driver);
-                (void) sd_device_get_devtype(device, &dev_type);
+                const char *mac_str;
 
+                (void) sd_device_get_property_value(device, "ID_PATH", &dev_path);
+                if (!dev_driver)
+                        (void) sd_device_get_property_value(device, "ID_NET_DRIVER", &dev_driver);
                 if (!dev_name)
                         (void) sd_device_get_sysname(device, &dev_name);
                 if (!dev_mac &&
@@ -163,19 +230,34 @@ bool net_match_config(Set *match_mac,
         if (match_mac && (!dev_mac || !set_contains(match_mac, dev_mac)))
                 return false;
 
+        if (match_permanent_mac &&
+            (!dev_permanent_mac ||
+             ether_addr_is_null(dev_permanent_mac) ||
+             !set_contains(match_permanent_mac, dev_permanent_mac)))
+                return false;
+
         if (!net_condition_test_strv(match_paths, dev_path))
                 return false;
 
         if (!net_condition_test_strv(match_drivers, dev_driver))
                 return false;
 
-        if (!net_condition_test_strv(match_types, dev_type))
+        if (!net_condition_test_strv(match_iftypes, dev_iftype_str))
                 return false;
 
-        if (!net_condition_test_strv(match_names, dev_name))
+        if (!net_condition_test_ifname(match_names, dev_name, alternative_names))
                 return false;
 
         if (!net_condition_test_property(match_property, device))
+                return false;
+
+        if (!net_condition_test_strv(match_wifi_iftype, wifi_iftype_to_string(dev_wifi_iftype)))
+                return false;
+
+        if (!net_condition_test_strv(match_ssid, dev_ssid))
+                return false;
+
+        if (match_bssid && (!dev_bssid || !set_contains(match_bssid, dev_bssid)))
                 return false;
 
         return true;
@@ -316,7 +398,7 @@ int config_parse_match_ifnames(
                         return 0;
                 }
 
-                if (!ifname_valid(word)) {
+                if (!ifname_valid_full(word, ltype)) {
                         log_syntax(unit, LOG_ERR, filename, line, 0,
                                    "Interface name is not valid or too long, ignoring assignment: %s", word);
                         continue;

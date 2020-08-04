@@ -3,7 +3,6 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "alloc-util.h"
 #include "fs-util.h"
@@ -126,11 +125,12 @@ int xdg_user_dirs(char ***ret_config_dirs, char ***ret_data_dirs) {
         _cleanup_strv_free_ char **config_dirs = NULL, **data_dirs = NULL;
 
         e = getenv("XDG_CONFIG_DIRS");
-        if (e) {
+        if (e)
                 config_dirs = strv_split(e, ":");
-                if (!config_dirs)
-                        return -ENOMEM;
-        }
+        else
+                config_dirs = strv_new("/etc/xdg");
+        if (!config_dirs)
+                return -ENOMEM;
 
         e = getenv("XDG_DATA_DIRS");
         if (e)

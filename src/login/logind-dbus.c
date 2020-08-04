@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
-#include <pwd.h>
-#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -14,11 +12,13 @@
 #include "bootspec.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
+#include "bus-polkit.h"
 #include "bus-unit-util.h"
 #include "bus-util.h"
 #include "cgroup-util.h"
 #include "device-util.h"
 #include "dirent-util.h"
+#include "efi-loader.h"
 #include "efivars.h"
 #include "env-util.h"
 #include "escape.h"
@@ -537,8 +537,8 @@ static int method_list_sessions(sd_bus_message *message, void *userdata, sd_bus_
 
                 r = sd_bus_message_append(reply, "(susso)",
                                           session->id,
-                                          (uint32_t) session->user->uid,
-                                          session->user->name,
+                                          (uint32_t) session->user->user_record->uid,
+                                          session->user->user_record->user_name,
                                           session->seat ? session->seat->id : "",
                                           p);
                 if (r < 0)
@@ -578,8 +578,8 @@ static int method_list_users(sd_bus_message *message, void *userdata, sd_bus_err
                         return -ENOMEM;
 
                 r = sd_bus_message_append(reply, "(uso)",
-                                          (uint32_t) user->uid,
-                                          user->name,
+                                          (uint32_t) user->user_record->uid,
+                                          user->user_record->user_name,
                                           p);
                 if (r < 0)
                         return r;
@@ -1016,6 +1016,8 @@ static int method_activate_session(sd_bus_message *message, void *userdata, sd_b
         if (r < 0)
                 return r;
 
+        /* PolicyKit is done by bus_session_method_activate() */
+
         return bus_session_method_activate(message, session, error);
 }
 
@@ -1046,6 +1048,20 @@ static int method_activate_session_on_seat(sd_bus_message *message, void *userda
         if (session->seat != seat)
                 return sd_bus_error_setf(error, BUS_ERROR_SESSION_NOT_ON_SEAT,
                                          "Session %s not on seat %s", session_name, seat_name);
+
+        r = bus_verify_polkit_async(
+                        message,
+                        CAP_SYS_ADMIN,
+                        "org.freedesktop.login1.chvt",
+                        NULL,
+                        false,
+                        UID_INVALID,
+                        &m->polkit_registry,
+                        error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Will call us back */
 
         r = session_activate(session);
         if (r < 0)
@@ -1489,7 +1505,7 @@ static int have_multiple_sessions(
          * count, and non-login sessions do not count either. */
         HASHMAP_FOREACH(session, m->sessions, i)
                 if (session->class == SESSION_USER &&
-                    session->user->uid != uid)
+                    session->user->user_record->uid != uid)
                         return true;
 
         return false;
@@ -2551,7 +2567,7 @@ static int method_can_reboot_parameter(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Manager *m = userdata;
+        _unused_ Manager *m = userdata;
         int r;
 
         assert(message);
@@ -2683,7 +2699,7 @@ static int method_can_reboot_to_firmware_setup(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Manager *m = userdata;
+        _unused_ Manager *m = userdata;
         int r;
 
         assert(message);
@@ -2851,14 +2867,14 @@ static int method_set_reboot_to_boot_loader_menu(
                         return r;
         } else {
                 if (x == UINT64_MAX) {
-                        if (unlink("/run/systemd/reboot-to-loader-menu") < 0 && errno != ENOENT)
+                        if (unlink("/run/systemd/reboot-to-boot-loader-menu") < 0 && errno != ENOENT)
                                 return -errno;
                 } else {
                         char buf[DECIMAL_STR_MAX(uint64_t) + 1];
 
                         xsprintf(buf, "%" PRIu64, x); /* µs granularity */
 
-                        r = write_string_file_atomic_label("/run/systemd/reboot-to-loader-menu", buf);
+                        r = write_string_file_atomic_label("/run/systemd/reboot-to-boot-loader-menu", buf);
                         if (r < 0)
                                 return r;
                 }
@@ -2872,7 +2888,7 @@ static int method_can_reboot_to_boot_loader_menu(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Manager *m = userdata;
+        _unused_ Manager *m = userdata;
         int r;
 
         assert(message);
@@ -3063,7 +3079,7 @@ static int method_can_reboot_to_boot_loader_entry(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Manager *m = userdata;
+        _unused_ Manager *m = userdata;
         int r;
 
         assert(message);
@@ -3154,6 +3170,12 @@ static int method_set_wall_message(
         if (r < 0)
                 return r;
 
+        /* Short-circuit the operation if the desired state is already in place, to
+         * avoid an unnecessary polkit permission check. */
+        if (streq_ptr(m->wall_message, empty_to_null(wall_message)) &&
+            m->enable_wall_messages == enable_wall_messages)
+                goto done;
+
         r = bus_verify_polkit_async(message,
                                     CAP_SYS_ADMIN,
                                     "org.freedesktop.login1.set-wall-message",
@@ -3173,6 +3195,7 @@ static int method_set_wall_message(
 
         m->enable_wall_messages = enable_wall_messages;
 
+ done:
         return sd_bus_reply_method_return(message, NULL);
 }
 
@@ -3408,7 +3431,7 @@ const sd_bus_vtable manager_vtable[] = {
         SD_BUS_VTABLE_END
 };
 
-static int session_jobs_reply(Session *s, const char *unit, const char *result) {
+static int session_jobs_reply(Session *s, uint32_t jid, const char *unit, const char *result) {
         assert(s);
         assert(unit);
 
@@ -3419,7 +3442,7 @@ static int session_jobs_reply(Session *s, const char *unit, const char *result) 
                 _cleanup_(sd_bus_error_free) sd_bus_error e = SD_BUS_ERROR_NULL;
 
                 sd_bus_error_setf(&e, BUS_ERROR_JOB_FAILED,
-                                  "Start job for unit '%s' failed with '%s'", unit, result);
+                                  "Job %u for unit '%s' failed with '%s'", jid, unit, result);
                 return session_send_create_reply(s, &e);
         }
 
@@ -3459,7 +3482,7 @@ int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *err
         if (session) {
                 if (streq_ptr(path, session->scope_job)) {
                         session->scope_job = mfree(session->scope_job);
-                        (void) session_jobs_reply(session, unit, result);
+                        (void) session_jobs_reply(session, id, unit, result);
 
                         session_save(session);
                         user_save(session->user);
@@ -3474,7 +3497,7 @@ int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *err
                         user->service_job = mfree(user->service_job);
 
                         LIST_FOREACH(sessions_by_user, session, user->sessions)
-                                (void) session_jobs_reply(session, unit, NULL /* don't propagate user service failures to the client */);
+                                (void) session_jobs_reply(session, id, unit, NULL /* don't propagate user service failures to the client */);
 
                         user_save(user);
                 }

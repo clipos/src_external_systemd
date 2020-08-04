@@ -4,7 +4,6 @@
 #include <getopt.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <string.h>
 
 #include "env-util.h"
 #include "log.h"
@@ -69,9 +68,9 @@ int dispatch_verb(int argc, char *argv[], const Verb verbs[], void *userdata) {
                 /* At the end of the list? */
                 if (!verbs[i].dispatch) {
                         if (name)
-                                log_error("Unknown operation %s.", name);
+                                log_error("Unknown command verb %s.", name);
                         else
-                                log_error("Requires operation parameter.");
+                                log_error("Command verb required.");
                         return -EINVAL;
                 }
 

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 TEST_DESCRIPTION="test setenv"
 
@@ -21,9 +21,6 @@ Description=Testsuite service
 [Service]
 ExecStart=/bin/bash -x /testsuite.sh
 Type=oneshot
-StandardOutput=tty
-StandardError=tty
-NotifyAccess=all
 EOF
         cp testsuite.sh $initdir/
 

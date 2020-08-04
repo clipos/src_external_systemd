@@ -99,13 +99,13 @@ static void test_bool_assign(void) {
         g = cp;    /* cast from pointer */
         h = NULL;  /* cast from pointer */
 
-        assert(b);
-        assert(c);
-        assert(d);
-        assert(e);
-        assert(!f);
-        assert(g);
-        assert(!h);
+        assert_se(b);
+        assert_se(c);
+        assert_se(d);
+        assert_se(e);
+        assert_se(!f);
+        assert_se(g);
+        assert_se(!h);
 }
 
 static int cleanup_counter = 0;
@@ -135,6 +135,9 @@ static void test_cleanup_order(void) {
 
 static void test_auto_erase_memory(void) {
         _cleanup_(erase_and_freep) uint8_t *p1, *p2;
+
+        /* print address of p2, else e.g. clang-11 will optimize it out */
+        log_debug("p1: %p p2: %p", &p1, &p2);
 
         assert_se(p1 = new(uint8_t, 1024));
         assert_se(p2 = new(uint8_t, 1024));

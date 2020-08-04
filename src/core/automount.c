@@ -152,6 +152,10 @@ static int automount_add_default_dependencies(Automount *a) {
         if (!MANAGER_IS_SYSTEM(UNIT(a)->manager))
                 return 0;
 
+        r = unit_add_dependency_by_name(UNIT(a), UNIT_BEFORE, SPECIAL_LOCAL_FS_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
+        if (r < 0)
+                return r;
+
         r = unit_add_dependency_by_name(UNIT(a), UNIT_AFTER, SPECIAL_LOCAL_FS_PRE_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
         if (r < 0)
                 return r;
@@ -168,9 +172,7 @@ static int automount_verify(Automount *a) {
         int r;
 
         assert(a);
-
-        if (UNIT(a)->load_state != UNIT_LOADED)
-                return 0;
+        assert(UNIT(a)->load_state == UNIT_LOADED);
 
         if (path_equal(a->where, "/")) {
                 log_unit_error(UNIT(a), "Cannot have an automount unit for the root directory. Refusing.");
@@ -205,6 +207,24 @@ static int automount_set_where(Automount *a) {
         return 1;
 }
 
+static int automount_add_extras(Automount *a) {
+        int r;
+
+        r = automount_set_where(a);
+        if (r < 0)
+                return r;
+
+        r = automount_add_trigger_dependencies(a);
+        if (r < 0)
+                return r;
+
+        r = automount_add_mount_dependencies(a);
+        if (r < 0)
+                return r;
+
+        return automount_add_default_dependencies(a);
+}
+
 static int automount_load(Unit *u) {
         Automount *a = AUTOMOUNT(u);
         int r;
@@ -213,27 +233,16 @@ static int automount_load(Unit *u) {
         assert(u->load_state == UNIT_STUB);
 
         /* Load a .automount file */
-        r = unit_load_fragment_and_dropin(u);
+        r = unit_load_fragment_and_dropin(u, true);
         if (r < 0)
                 return r;
 
-        if (u->load_state == UNIT_LOADED) {
-                r = automount_set_where(a);
-                if (r < 0)
-                        return r;
+        if (u->load_state != UNIT_LOADED)
+                return 0;
 
-                r = automount_add_trigger_dependencies(a);
-                if (r < 0)
-                        return r;
-
-                r = automount_add_mount_dependencies(a);
-                if (r < 0)
-                        return r;
-
-                r = automount_add_default_dependencies(a);
-                if (r < 0)
-                        return r;
-        }
+        r = automount_add_extras(a);
+        if (r < 0)
+                return r;
 
         return automount_verify(a);
 }
@@ -1100,6 +1109,11 @@ const UnitVTable automount_vtable = {
                 "Unit\0"
                 "Automount\0"
                 "Install\0",
+        .private_section = "Automount",
+
+        .can_transient = true,
+        .can_fail = true,
+        .can_trigger = true,
 
         .init = automount_init,
         .load = automount_load,
@@ -1126,8 +1140,6 @@ const UnitVTable automount_vtable = {
 
         .bus_vtable = bus_automount_vtable,
         .bus_set_property = bus_automount_set_property,
-
-        .can_transient = true,
 
         .shutdown = automount_shutdown,
         .supported = automount_supported,

@@ -20,14 +20,39 @@ typedef struct SleepConfig {
         usec_t hibernate_delay_sec; /* HibernateDelaySec */
 } SleepConfig;
 
-void free_sleep_config(SleepConfig *sc);
+SleepConfig* free_sleep_config(SleepConfig *sc);
 DEFINE_TRIVIAL_CLEANUP_FUNC(SleepConfig*, free_sleep_config);
+
+/* entry in /proc/swaps */
+typedef struct SwapEntry {
+        char *device;
+        char *type;
+        uint64_t size;
+        uint64_t used;
+        int priority;
+} SwapEntry;
+
+SwapEntry* swap_entry_free(SwapEntry *se);
+DEFINE_TRIVIAL_CLEANUP_FUNC(SwapEntry*, swap_entry_free);
+
+/*
+ * represents values for /sys/power/resume & /sys/power/resume_offset
+ * and the matching /proc/swap entry.
+ */
+typedef struct HibernateLocation {
+        dev_t devno;
+        uint64_t offset;
+        SwapEntry *swap;
+} HibernateLocation;
+
+HibernateLocation* hibernate_location_free(HibernateLocation *hl);
+DEFINE_TRIVIAL_CLEANUP_FUNC(HibernateLocation*, hibernate_location_free);
 
 int sleep_settings(const char *verb, const SleepConfig *sleep_config, bool *ret_allow, char ***ret_modes, char ***ret_states);
 
 int read_fiemap(int fd, struct fiemap **ret);
 int parse_sleep_config(SleepConfig **sleep_config);
-int find_hibernate_location(char **device, char **type, uint64_t *size, uint64_t *used);
+int find_hibernate_location(HibernateLocation **ret_hibernate_location);
 
 int can_sleep(const char *verb);
 int can_sleep_disk(char **types);

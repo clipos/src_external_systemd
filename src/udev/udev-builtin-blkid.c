@@ -5,13 +5,11 @@
  * Copyright © 2011 Karel Zak <kzak@redhat.com>
  */
 
-#include <blkid.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/stat.h>
 
 #include "sd-id128.h"
@@ -19,7 +17,7 @@
 #include "alloc-util.h"
 #include "blkid-util.h"
 #include "device-util.h"
-#include "efivars.h"
+#include "efi-loader.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "gpt.h"

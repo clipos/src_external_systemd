@@ -1,20 +1,14 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
-#include <blkid.h>
 #include <ctype.h>
-#include <dirent.h>
 #include <errno.h>
 #include <ftw.h>
 #include <getopt.h>
 #include <limits.h>
 #include <linux/magic.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/statfs.h>
 #include <unistd.h>
 
 #include "sd-id128.h"
@@ -24,6 +18,7 @@
 #include "bootspec.h"
 #include "copy.h"
 #include "dirent-util.h"
+#include "efi-loader.h"
 #include "efivars.h"
 #include "env-util.h"
 #include "escape.h"
@@ -56,6 +51,7 @@ static bool arg_print_esp_path = false;
 static bool arg_print_dollar_boot_path = false;
 static bool arg_touch_variables = true;
 static PagerFlags arg_pager_flags = 0;
+static bool arg_graceful = false;
 
 STATIC_DESTRUCTOR_REGISTER(arg_esp_path, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_xbootldr_path, freep);
@@ -521,7 +517,7 @@ static int copy_file_with_version_check(const char *from, const char *to, bool f
         if (!force) {
                 fd_to = open(to, O_RDONLY|O_CLOEXEC|O_NOCTTY);
                 if (fd_to < 0) {
-                        if (errno != -ENOENT)
+                        if (errno != ENOENT)
                                 return log_error_errno(errno, "Failed to open \"%s\" for reading: %m", to);
                 } else {
                         r = version_check(fd_from, from, fd_to, to);
@@ -1037,8 +1033,21 @@ static int help(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return log_oom();
 
-        printf("%s [COMMAND] [OPTIONS...]\n\n"
-               "Install, update or remove the systemd-boot EFI boot manager.\n\n"
+        printf("%s  [OPTIONS...] COMMAND ...\n"
+               "\n%sInstall/update/remove the systemd-boot EFI boot manager and list/select entries.%s\n"
+               "\nBoot Loader Commands:\n"
+               "  status              Show status of installed systemd-boot and EFI variables\n"
+               "  install             Install systemd-boot to the ESP and EFI variables\n"
+               "  update              Update systemd-boot in the ESP and EFI variables\n"
+               "  remove              Remove systemd-boot from the ESP and EFI variables\n"
+               "  is-installed        Test whether systemd-boot is installed in the ESP\n"
+               "  random-seed         Initialize random seed in ESP and EFI variables\n"
+               "  systemd-efi-options Query or set system options string in EFI variable\n"
+               "\nBoot Loader Entries Commands:\n"
+               "  list                List boot loader entries\n"
+               "  set-default ID      Set default boot loader entry\n"
+               "  set-oneshot ID      Set default boot loader entry, for next boot only\n"
+               "\nOptions:\n"
                "  -h --help            Show this help\n"
                "     --version         Print version\n"
                "     --esp-path=PATH   Path to the EFI System Partition (ESP)\n"
@@ -1047,19 +1056,12 @@ static int help(int argc, char *argv[], void *userdata) {
                "  -x --print-boot-path Print path to the $BOOT partition\n"
                "     --no-variables    Don't touch EFI variables\n"
                "     --no-pager        Do not pipe output into a pager\n"
-               "\nBoot Loader Commands:\n"
-               "     status            Show status of installed systemd-boot and EFI variables\n"
-               "     install           Install systemd-boot to the ESP and EFI variables\n"
-               "     update            Update systemd-boot in the ESP and EFI variables\n"
-               "     remove            Remove systemd-boot from the ESP and EFI variables\n"
-               "     random-seed       Initialize random seed in ESP and EFI variables\n"
-               "     is-installed      Test whether systemd-boot is installed in the ESP\n"
-               "\nBoot Loader Entries Commands:\n"
-               "     list              List boot loader entries\n"
-               "     set-default ID    Set default boot loader entry\n"
-               "     set-oneshot ID    Set default boot loader entry, for next boot only\n"
+               "     --graceful        Don't fail when the ESP cannot be found or EFI\n"
+               "                       variables cannot be written\n"
                "\nSee the %s for details.\n"
                , program_invocation_short_name
+               , ansi_highlight()
+               , ansi_normal()
                , link);
 
         return 0;
@@ -1072,6 +1074,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_VERSION,
                 ARG_NO_VARIABLES,
                 ARG_NO_PAGER,
+                ARG_GRACEFUL,
         };
 
         static const struct option options[] = {
@@ -1085,6 +1088,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "print-boot-path", no_argument,       NULL, 'x'                 },
                 { "no-variables",    no_argument,       NULL, ARG_NO_VARIABLES    },
                 { "no-pager",        no_argument,       NULL, ARG_NO_PAGER        },
+                { "graceful",        no_argument,       NULL, ARG_GRACEFUL        },
                 {}
         };
 
@@ -1137,6 +1141,10 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
+                case ARG_GRACEFUL:
+                        arg_graceful = true;
+                        break;
+
                 case '?':
                         return -EINVAL;
 
@@ -1153,6 +1161,15 @@ static void read_loader_efi_var(const char *name, char **var) {
         r = efi_get_variable_string(EFI_VENDOR_LOADER, name, var);
         if (r < 0 && r != -ENOENT)
                 log_warning_errno(r, "Failed to read EFI variable %s: %m", name);
+}
+
+static void print_yes_no_line(bool first, bool good, const char *name) {
+        printf("%s%s%s%s %s\n",
+               first ? "     Features: " : "               ",
+               good ? ansi_highlight_green() : ansi_highlight_red(),
+               good ? special_glyph(SPECIAL_GLYPH_CHECK_MARK) : special_glyph(SPECIAL_GLYPH_CROSS_MARK),
+               ansi_normal(),
+               name);
 }
 
 static int verb_status(int argc, char *argv[], void *userdata) {
@@ -1234,18 +1251,15 @@ static int verb_status(int argc, char *argv[], void *userdata) {
                 printf("Current Boot Loader:\n");
                 printf("      Product: %s%s%s\n", ansi_highlight(), strna(loader), ansi_normal());
 
-                for (i = 0; i < ELEMENTSOF(flags); i++) {
+                for (i = 0; i < ELEMENTSOF(flags); i++)
+                        print_yes_no_line(i == 0, FLAGS_SET(loader_features, flags[i].flag), flags[i].name);
 
-                        if (i == 0)
-                                printf("     Features: ");
-                        else
-                                printf("               ");
+                sd_id128_t bootloader_esp_uuid;
+                bool have_bootloader_esp_uuid = efi_loader_get_device_part_uuid(&bootloader_esp_uuid) >= 0;
 
-                        if (FLAGS_SET(loader_features, flags[i].flag))
-                                printf("%s%s%s %s\n", ansi_highlight_green(), special_glyph(SPECIAL_GLYPH_CHECK_MARK), ansi_normal(), flags[i].name);
-                        else
-                                printf("%s%s%s %s\n", ansi_highlight_red(), special_glyph(SPECIAL_GLYPH_CROSS_MARK), ansi_normal(), flags[i].name);
-                }
+                print_yes_no_line(false, have_bootloader_esp_uuid, "Boot loader sets ESP partition information");
+                if (have_bootloader_esp_uuid && !sd_id128_equal(esp_uuid, bootloader_esp_uuid))
+                        printf("WARNING: The boot loader reports different ESP UUID then detected!\n");
 
                 if (stub)
                         printf("         Stub: %s\n", stub);
@@ -1459,11 +1473,18 @@ static int install_random_seed(const char *esp) {
          * state. */
         RUN_WITH_UMASK(0077) {
                 r = efi_set_variable(EFI_VENDOR_LOADER, "LoaderSystemToken", buffer, sz);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to set LoaderSystemToken EFI variable: %m");
+                if (r < 0) {
+                        if (!arg_graceful)
+                                return log_error_errno(r, "Failed to write 'LoaderSystemToken' EFI variable: %m");
+
+                        if (r == -EINVAL)
+                                log_warning_errno(r, "Unable to write 'LoaderSystemToken' EFI variable (firmware problem?), ignoring: %m");
+                        else
+                                log_warning_errno(r, "Unable to write 'LoaderSystemToken' EFI variable, ignoring: %m");
+                } else
+                        log_info("Successfully initialized system token in EFI variable with %zu bytes.", sz);
         }
 
-        log_info("Successfully initialized system token in EFI variable with %zu bytes.", sz);
         return 0;
 }
 
@@ -1705,7 +1726,15 @@ static int verb_set_default(int argc, char *argv[], void *userdata) {
 static int verb_random_seed(int argc, char *argv[], void *userdata) {
         int r;
 
-        r = acquire_esp(false, NULL, NULL, NULL, NULL);
+        r = find_esp_and_warn(arg_esp_path, false, &arg_esp_path, NULL, NULL, NULL, NULL);
+        if (r == -ENOKEY) {
+                /* find_esp_and_warn() doesn't warn about ENOKEY, so let's do that on our own */
+                if (!arg_graceful)
+                        return log_error_errno(r, "Unable to find ESP.");
+
+                log_notice("No ESP found, not initializing random seed.");
+                return 0;
+        }
         if (r < 0)
                 return r;
 
@@ -1717,18 +1746,40 @@ static int verb_random_seed(int argc, char *argv[], void *userdata) {
         return 0;
 }
 
+static int verb_systemd_efi_options(int argc, char *argv[], void *userdata) {
+        int r;
+
+        if (argc == 1) {
+                _cleanup_free_ char *line = NULL;
+
+                r = systemd_efi_options_variable(&line);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to query SystemdOptions EFI variable: %m");
+
+                puts(line);
+
+        } else {
+                r = efi_set_variable_string(EFI_VENDOR_SYSTEMD, "SystemdOptions", argv[1]);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to set SystemdOptions EFI variable: %m");
+        }
+
+        return 0;
+}
+
 static int bootctl_main(int argc, char *argv[]) {
         static const Verb verbs[] = {
-                { "help",         VERB_ANY, VERB_ANY, 0,            help              },
-                { "status",       VERB_ANY, 1,        VERB_DEFAULT, verb_status       },
-                { "install",      VERB_ANY, 1,        0,            verb_install      },
-                { "update",       VERB_ANY, 1,        0,            verb_install      },
-                { "remove",       VERB_ANY, 1,        0,            verb_remove       },
-                { "random-seed",  VERB_ANY, 1,        0,            verb_random_seed  },
-                { "is-installed", VERB_ANY, 1,        0,            verb_is_installed },
-                { "list",         VERB_ANY, 1,        0,            verb_list         },
-                { "set-default",  2,        2,        0,            verb_set_default  },
-                { "set-oneshot",  2,        2,        0,            verb_set_default  },
+                { "help",                VERB_ANY, VERB_ANY, 0,            help                     },
+                { "status",              VERB_ANY, 1,        VERB_DEFAULT, verb_status              },
+                { "install",             VERB_ANY, 1,        0,            verb_install             },
+                { "update",              VERB_ANY, 1,        0,            verb_install             },
+                { "remove",              VERB_ANY, 1,        0,            verb_remove              },
+                { "is-installed",        VERB_ANY, 1,        0,            verb_is_installed        },
+                { "list",                VERB_ANY, 1,        0,            verb_list                },
+                { "set-default",         2,        2,        0,            verb_set_default         },
+                { "set-oneshot",         2,        2,        0,            verb_set_default         },
+                { "random-seed",         VERB_ANY, 1,        0,            verb_random_seed         },
+                { "systemd-efi-options", VERB_ANY, 2,        0,            verb_systemd_efi_options },
                 {}
         };
 

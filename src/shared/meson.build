@@ -12,6 +12,8 @@ shared_sources = files('''
         barrier.h
         base-filesystem.c
         base-filesystem.h
+        binfmt-util.c
+        binfmt-util.h
         bitmap.c
         bitmap.h
         blkid-util.h
@@ -27,14 +29,20 @@ shared_sources = files('''
         bus-unit-util.h
         bus-util.c
         bus-util.h
+        bus-polkit.c
+        bus-polkit.h
         bus-wait-for-jobs.c
         bus-wait-for-jobs.h
         bus-wait-for-units.c
         bus-wait-for-units.h
         calendarspec.c
         calendarspec.h
+        cgroup-setup.c
+        cgroup-setup.h
         cgroup-show.c
         cgroup-show.h
+        chown-recursive.c
+        chown-recursive.h
         clean-ipc.c
         clean-ipc.h
         clock-util.c
@@ -58,8 +66,8 @@ shared_sources = files('''
         dns-domain.h
         dropin.c
         dropin.h
-        efivars.c
-        efivars.h
+        efi-loader.c
+        efi-loader.h
         enable-mempool.c
         env-file-label.c
         env-file-label.h
@@ -81,7 +89,14 @@ shared_sources = files('''
         fstab-util.h
         generator.c
         generator.h
+        gpt.c
         gpt.h
+        group-record-nss.c
+        group-record-nss.h
+        group-record-show.c
+        group-record-show.h
+        group-record.c
+        group-record.h
         id128-print.c
         id128-print.h
         ima-util.c
@@ -102,6 +117,8 @@ shared_sources = files('''
         json-internal.h
         json.c
         json.h
+        libcrypt-util.c
+        libcrypt-util.h
         libmount-util.h
         linux/auto_dev-ioctl.h
         linux/bpf.h
@@ -126,10 +143,15 @@ shared_sources = files('''
         module-util.h
         mount-util.c
         mount-util.h
+        netif-naming-scheme.c
+        netif-naming-scheme.h
         nscd-flush.c
         nscd-flush.h
         nsflags.c
         nsflags.h
+        numa-util.c
+        numa-util.h
+        openssl-util.h
         os-util.c
         os-util.h
         output-mode.c
@@ -139,12 +161,16 @@ shared_sources = files('''
         path-lookup.c
         path-lookup.h
         pe-header.h
+        pkcs11-util.c
+        pkcs11-util.h
         pretty-print.c
         pretty-print.h
         ptyfwd.c
         ptyfwd.h
         reboot-util.c
         reboot-util.h
+        resize-fs.c
+        resize-fs.h
         resolve-util.c
         resolve-util.h
         seccomp-util.h
@@ -154,6 +180,8 @@ shared_sources = files('''
         serialize.h
         sleep-config.c
         sleep-config.h
+        socket-netlink.c
+        socket-netlink.h
         spawn-ask-password-agent.c
         spawn-ask-password-agent.h
         spawn-polkit-agent.c
@@ -174,6 +202,14 @@ shared_sources = files('''
         uid-range.h
         unit-file.c
         unit-file.h
+        user-record-nss.c
+        user-record-nss.h
+        user-record-show.c
+        user-record-show.h
+        user-record.c
+        user-record.h
+        userdb.c
+        userdb.h
         utmp-wtmp.h
         varlink.c
         varlink.h
@@ -187,6 +223,8 @@ shared_sources = files('''
         watchdog.h
         web-util.c
         web-util.h
+        wifi-util.c
+        wifi-util.h
         xml.c
         xml.h
 '''.split())
@@ -216,6 +254,13 @@ endif
 
 if conf.get('HAVE_KMOD') == 1
         shared_sources += files('module-util.c')
+endif
+
+if conf.get('HAVE_PAM') == 1
+        shared_sources += files('''
+        pam-util.c
+        pam-util.h
+'''.split())
 endif
 
 generate_ip_protocol_list = find_program('generate-ip-protocol-list.sh')
@@ -261,20 +306,24 @@ shared_sources += shared_generated_gperf_headers
 libshared_name = 'systemd-shared-@0@'.format(meson.project_version())
 
 libshared_deps = [threads,
-                  librt,
-                  libcap,
                   libacl,
+                  libblkid,
+                  libcap,
+                  libcrypt,
                   libcryptsetup,
                   libgcrypt,
+                  libidn,
                   libiptc,
                   libkmod,
+                  liblz4,
                   libmount,
+                  libopenssl,
+                  libp11kit,
+                  libpam,
+                  librt,
                   libseccomp,
                   libselinux,
-                  libidn,
-                  libxz,
-                  liblz4,
-                  libblkid]
+                  libxz]
 
 libshared_sym_path = '@0@/libshared.sym'.format(meson.current_source_dir())
 

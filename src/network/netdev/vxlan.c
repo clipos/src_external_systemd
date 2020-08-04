@@ -2,8 +2,6 @@
 
 #include <net/if.h>
 
-#include "sd-netlink.h"
-
 #include "conf-parser.h"
 #include "alloc-util.h"
 #include "extract-word.h"
@@ -11,10 +9,7 @@
 #include "string-util.h"
 #include "strv.h"
 #include "parse-util.h"
-#include "missing.h"
-
-#include "networkd-link.h"
-#include "netdev/vxlan.h"
+#include "vxlan.h"
 
 static const char* const df_table[_NETDEV_VXLAN_DF_MAX] = {
         [NETDEV_VXLAN_DF_NO] = "no",
@@ -376,7 +371,7 @@ static void vxlan_init(NetDev *netdev) {
 const NetDevVTable vxlan_vtable = {
         .object_size = sizeof(VxLan),
         .init = vxlan_init,
-        .sections = "Match\0NetDev\0VXLAN\0",
+        .sections = NETDEV_COMMON_SECTIONS "VXLAN\0",
         .fill_message_create = netdev_vxlan_fill_message_create,
         .create_type = NETDEV_CREATE_STACKED,
         .config_verify = netdev_vxlan_verify,

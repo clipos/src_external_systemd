@@ -11,10 +11,8 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
-#include <sys/socket.h>
 #include <sys/sysmacros.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -83,31 +81,34 @@ int chvt(int vt) {
 int read_one_char(FILE *f, char *ret, usec_t t, bool *need_nl) {
         _cleanup_free_ char *line = NULL;
         struct termios old_termios;
-        int r;
+        int r, fd;
 
         assert(f);
         assert(ret);
 
-        /* If this is a terminal, then switch canonical mode off, so that we can read a single character */
-        if (tcgetattr(fileno(f), &old_termios) >= 0) {
+        /* If this is a terminal, then switch canonical mode off, so that we can read a single
+         * character. (Note that fmemopen() streams do not have an fd associated with them, let's handle that
+         * nicely.) */
+        fd = fileno(f);
+        if (fd >= 0 && tcgetattr(fd, &old_termios) >= 0) {
                 struct termios new_termios = old_termios;
 
                 new_termios.c_lflag &= ~ICANON;
                 new_termios.c_cc[VMIN] = 1;
                 new_termios.c_cc[VTIME] = 0;
 
-                if (tcsetattr(fileno(f), TCSADRAIN, &new_termios) >= 0) {
+                if (tcsetattr(fd, TCSADRAIN, &new_termios) >= 0) {
                         char c;
 
                         if (t != USEC_INFINITY) {
-                                if (fd_wait_for_event(fileno(f), POLLIN, t) <= 0) {
-                                        (void) tcsetattr(fileno(f), TCSADRAIN, &old_termios);
+                                if (fd_wait_for_event(fd, POLLIN, t) <= 0) {
+                                        (void) tcsetattr(fd, TCSADRAIN, &old_termios);
                                         return -ETIMEDOUT;
                                 }
                         }
 
                         r = safe_fgetc(f, &c);
-                        (void) tcsetattr(fileno(f), TCSADRAIN, &old_termios);
+                        (void) tcsetattr(fd, TCSADRAIN, &old_termios);
                         if (r < 0)
                                 return r;
                         if (r == 0)
@@ -121,8 +122,13 @@ int read_one_char(FILE *f, char *ret, usec_t t, bool *need_nl) {
                 }
         }
 
-        if (t != USEC_INFINITY) {
-                if (fd_wait_for_event(fileno(f), POLLIN, t) <= 0)
+        if (t != USEC_INFINITY && fd > 0) {
+                /* Let's wait the specified amount of time for input. When we have no fd we skip this, under
+                 * the assumption that this is an fmemopen() stream or so where waiting doesn't make sense
+                 * anyway, as the data is either already in the stream or cannot possible be placed there
+                 * while we access the stream */
+
+                if (fd_wait_for_event(fd, POLLIN, t) <= 0)
                         return -ETIMEDOUT;
         }
 
@@ -780,6 +786,9 @@ const char *default_term_for_tty(const char *tty) {
 int fd_columns(int fd) {
         struct winsize ws = {};
 
+        if (fd < 0)
+                return -EBADF;
+
         if (ioctl(fd, TIOCGWINSZ, &ws) < 0)
                 return -errno;
 
@@ -813,6 +822,9 @@ unsigned columns(void) {
 
 int fd_lines(int fd) {
         struct winsize ws = {};
+
+        if (fd < 0)
+                return -EBADF;
 
         if (ioctl(fd, TIOCGWINSZ, &ws) < 0)
                 return -errno;
@@ -1208,6 +1220,11 @@ bool colors_enabled(void) {
                 val = getenv_bool("SYSTEMD_COLORS");
                 if (val >= 0)
                         cached_colors_enabled = val;
+
+                else if (getenv("NO_COLOR"))
+                        /* We only check for the presence of the variable; value is ignored. */
+                        cached_colors_enabled = false;
+
                 else if (getpid_cached() == 1)
                         /* PID1 outputs to the console without holding it open all the time */
                         cached_colors_enabled = !getenv_terminal_is_dumb();
@@ -1232,6 +1249,9 @@ bool dev_console_colors_enabled(void) {
         b = getenv_bool("SYSTEMD_COLORS");
         if (b >= 0)
                 return b;
+
+        if (getenv("NO_COLOR"))
+                return false;
 
         if (getenv_for_pid(1, "TERM", &s) <= 0)
                 (void) proc_cmdline_get_key("TERM", 0, &s);

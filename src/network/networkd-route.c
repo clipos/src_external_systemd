@@ -12,11 +12,12 @@
 #include "networkd-route.h"
 #include "parse-util.h"
 #include "set.h"
+#include "socket-netlink.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strxcpyx.h"
 #include "sysctl-util.h"
-#include "util.h"
+#include "vrf.h"
 
 #define ROUTES_DEFAULT_MAX_PER_FAMILY 4096U
 
@@ -144,6 +145,8 @@ void route_free(Route *route) {
                 set_remove(route->link->routes_foreign, route);
         }
 
+        ordered_set_free_free(route->multipath_routes);
+
         sd_event_source_unref(route->expire);
 
         free(route);
@@ -157,13 +160,25 @@ static void route_hash_func(const Route *route, struct siphash *state) {
         switch (route->family) {
         case AF_INET:
         case AF_INET6:
-                /* Equality of routes are given by the 4-touple
-                   (dst_prefix,dst_prefixlen,tos,priority,table) */
-                siphash24_compress(&route->dst, FAMILY_ADDRESS_SIZE(route->family), state);
                 siphash24_compress(&route->dst_prefixlen, sizeof(route->dst_prefixlen), state);
+                siphash24_compress(&route->dst, FAMILY_ADDRESS_SIZE(route->family), state);
+
+                siphash24_compress(&route->src_prefixlen, sizeof(route->src_prefixlen), state);
+                siphash24_compress(&route->src, FAMILY_ADDRESS_SIZE(route->family), state);
+
+                siphash24_compress(&route->gw, FAMILY_ADDRESS_SIZE(route->family), state);
+
+                siphash24_compress(&route->prefsrc, FAMILY_ADDRESS_SIZE(route->family), state);
+
                 siphash24_compress(&route->tos, sizeof(route->tos), state);
                 siphash24_compress(&route->priority, sizeof(route->priority), state);
                 siphash24_compress(&route->table, sizeof(route->table), state);
+                siphash24_compress(&route->protocol, sizeof(route->protocol), state);
+                siphash24_compress(&route->scope, sizeof(route->scope), state);
+                siphash24_compress(&route->type, sizeof(route->type), state);
+
+                siphash24_compress(&route->initcwnd, sizeof(route->initcwnd), state);
+                siphash24_compress(&route->initrwnd, sizeof(route->initrwnd), state);
 
                 break;
         default:
@@ -186,75 +201,23 @@ static int route_compare_func(const Route *a, const Route *b) {
                 if (r != 0)
                         return r;
 
-                r = CMP(a->tos, b->tos);
-                if (r != 0)
-                        return r;
-
-                r = CMP(a->priority, b->priority);
-                if (r != 0)
-                        return r;
-
-                r = CMP(a->table, b->table);
-                if (r != 0)
-                        return r;
-
                 r = memcmp(&a->dst, &b->dst, FAMILY_ADDRESS_SIZE(a->family));
                 if (r != 0)
                         return r;
 
-                return memcmp(&a->gw, &b->gw, FAMILY_ADDRESS_SIZE(a->family));
-        default:
-                /* treat any other address family as AF_UNSPEC */
-                return 0;
-        }
-}
-
-DEFINE_PRIVATE_HASH_OPS(route_hash_ops, Route, route_hash_func, route_compare_func);
-
-static void route_full_hash_func(const Route *route, struct siphash *state) {
-        assert(route);
-
-        siphash24_compress(&route->family, sizeof(route->family), state);
-
-        switch (route->family) {
-        case AF_INET:
-        case AF_INET6:
-                siphash24_compress(&route->gw, FAMILY_ADDRESS_SIZE(route->family), state);
-                siphash24_compress(&route->dst, FAMILY_ADDRESS_SIZE(route->family), state);
-                siphash24_compress(&route->dst_prefixlen, sizeof(route->dst_prefixlen), state);
-                siphash24_compress(&route->src, FAMILY_ADDRESS_SIZE(route->family), state);
-                siphash24_compress(&route->src_prefixlen, sizeof(route->src_prefixlen), state);
-                siphash24_compress(&route->prefsrc, FAMILY_ADDRESS_SIZE(route->family), state);
-
-                siphash24_compress(&route->tos, sizeof(route->tos), state);
-                siphash24_compress(&route->priority, sizeof(route->priority), state);
-                siphash24_compress(&route->table, sizeof(route->table), state);
-                siphash24_compress(&route->protocol, sizeof(route->protocol), state);
-                siphash24_compress(&route->scope, sizeof(route->scope), state);
-                siphash24_compress(&route->type, sizeof(route->type), state);
-
-                break;
-        default:
-                /* treat any other address family as AF_UNSPEC */
-                break;
-        }
-}
-
-static int route_full_compare_func(const Route *a, const Route *b) {
-        int r;
-
-        r = CMP(a->family, b->family);
-        if (r != 0)
-                return r;
-
-        switch (a->family) {
-        case AF_INET:
-        case AF_INET6:
-                r = CMP(a->dst_prefixlen, b->dst_prefixlen);
+                r = CMP(a->src_prefixlen, b->src_prefixlen);
                 if (r != 0)
                         return r;
 
-                r = CMP(a->src_prefixlen, b->src_prefixlen);
+                r = memcmp(&a->src, &b->src, FAMILY_ADDRESS_SIZE(a->family));
+                if (r != 0)
+                        return r;
+
+                r = memcmp(&a->gw, &b->gw, FAMILY_ADDRESS_SIZE(a->family));
+                if (r != 0)
+                        return r;
+
+                r = memcmp(&a->prefsrc, &b->prefsrc, FAMILY_ADDRESS_SIZE(a->family));
                 if (r != 0)
                         return r;
 
@@ -282,19 +245,15 @@ static int route_full_compare_func(const Route *a, const Route *b) {
                 if (r != 0)
                         return r;
 
-                r = memcmp(&a->gw, &b->gw, FAMILY_ADDRESS_SIZE(a->family));
+                r = CMP(a->initcwnd, b->initcwnd);
                 if (r != 0)
                         return r;
 
-                r = memcmp(&a->dst, &b->dst, FAMILY_ADDRESS_SIZE(a->family));
+                r = CMP(a->initrwnd, b->initrwnd);
                 if (r != 0)
                         return r;
 
-                r = memcmp(&a->src, &b->src, FAMILY_ADDRESS_SIZE(a->family));
-                if (r != 0)
-                        return r;
-
-                return memcmp(&a->prefsrc, &b->prefsrc, FAMILY_ADDRESS_SIZE(a->family));
+                return 0;
         default:
                 /* treat any other address family as AF_UNSPEC */
                 return 0;
@@ -302,10 +261,10 @@ static int route_full_compare_func(const Route *a, const Route *b) {
 }
 
 DEFINE_HASH_OPS_WITH_KEY_DESTRUCTOR(
-                route_full_hash_ops,
+                route_hash_ops,
                 Route,
-                route_full_hash_func,
-                route_full_compare_func,
+                route_hash_func,
+                route_compare_func,
                 route_free);
 
 bool route_equal(Route *r1, Route *r2) {
@@ -318,39 +277,21 @@ bool route_equal(Route *r1, Route *r2) {
         return route_compare_func(r1, r2) == 0;
 }
 
-int route_get(Link *link,
-              int family,
-              const union in_addr_union *dst,
-              unsigned char dst_prefixlen,
-              const union in_addr_union *gw,
-              unsigned char tos,
-              uint32_t priority,
-              uint32_t table,
-              Route **ret) {
+int route_get(Link *link, Route *in, Route **ret) {
 
-        Route route, *existing;
+        Route *existing;
 
         assert(link);
-        assert(dst);
+        assert(in);
 
-        route = (Route) {
-                .family = family,
-                .dst = *dst,
-                .dst_prefixlen = dst_prefixlen,
-                .gw = gw ? *gw : IN_ADDR_NULL,
-                .tos = tos,
-                .priority = priority,
-                .table = table,
-        };
-
-        existing = set_get(link->routes, &route);
+        existing = set_get(link->routes, in);
         if (existing) {
                 if (ret)
                         *ret = existing;
                 return 1;
         }
 
-        existing = set_get(link->routes_foreign, &route);
+        existing = set_get(link->routes_foreign, in);
         if (existing) {
                 if (ret)
                         *ret = existing;
@@ -360,37 +301,35 @@ int route_get(Link *link,
         return -ENOENT;
 }
 
-static int route_add_internal(
-                Link *link,
-                Set **routes,
-                int family,
-                const union in_addr_union *dst,
-                unsigned char dst_prefixlen,
-                const union in_addr_union *gw,
-                unsigned char tos,
-                uint32_t priority,
-                uint32_t table,
-                Route **ret) {
+static int route_add_internal(Link *link, Set **routes, Route *in, Route **ret) {
 
         _cleanup_(route_freep) Route *route = NULL;
         int r;
 
         assert(link);
         assert(routes);
-        assert(dst);
+        assert(in);
 
         r = route_new(&route);
         if (r < 0)
                 return r;
 
-        route->family = family;
-        route->dst = *dst;
-        route->dst_prefixlen = dst_prefixlen;
-        route->dst = *dst;
-        route->gw = gw ? *gw : IN_ADDR_NULL;
-        route->tos = tos;
-        route->priority = priority;
-        route->table = table;
+        route->family = in->family;
+        route->src = in->src;
+        route->src_prefixlen = in->src_prefixlen;
+        route->dst = in->dst;
+        route->dst_prefixlen = in->dst_prefixlen;
+        route->gw = in->gw;
+        route->prefsrc = in->prefsrc;
+        route->scope = in->scope;
+        route->protocol = in->protocol;
+        route->type = in->type;
+        route->tos = in->tos;
+        route->priority = in->priority;
+        route->table = in->table;
+        route->initcwnd = in->initcwnd;
+        route->initrwnd = in->initrwnd;
+        route->lifetime = in->lifetime;
 
         r = set_ensure_allocated(routes, &route_hash_ops);
         if (r < 0)
@@ -412,37 +351,19 @@ static int route_add_internal(
         return 0;
 }
 
-int route_add_foreign(
-                Link *link,
-                int family,
-                const union in_addr_union *dst,
-                unsigned char dst_prefixlen,
-                const union in_addr_union *gw,
-                unsigned char tos,
-                uint32_t priority,
-                uint32_t table,
-                Route **ret) {
-
-        return route_add_internal(link, &link->routes_foreign, family, dst, dst_prefixlen, gw, tos, priority, table, ret);
+int route_add_foreign(Link *link, Route *in, Route **ret) {
+        return route_add_internal(link, &link->routes_foreign, in, ret);
 }
 
-int route_add(Link *link,
-              int family,
-              const union in_addr_union *dst,
-              unsigned char dst_prefixlen,
-              const union in_addr_union *gw,
-              unsigned char tos,
-              uint32_t priority,
-              uint32_t table,
-              Route **ret) {
+int route_add(Link *link, Route *in, Route **ret) {
 
         Route *route;
         int r;
 
-        r = route_get(link, family, dst, dst_prefixlen, gw, tos, priority, table, &route);
+        r = route_get(link, in, &route);
         if (r == -ENOENT) {
                 /* Route does not exist, create a new one */
-                r = route_add_internal(link, &link->routes, family, dst, dst_prefixlen, gw, tos, priority, table, &route);
+                r = route_add_internal(link, &link->routes, in, &route);
                 if (r < 0)
                         return r;
         } else if (r == 0) {
@@ -468,27 +389,6 @@ int route_add(Link *link,
         return 0;
 }
 
-void route_update(Route *route,
-                  const union in_addr_union *src,
-                  unsigned char src_prefixlen,
-                  const union in_addr_union *gw,
-                  const union in_addr_union *prefsrc,
-                  unsigned char scope,
-                  unsigned char protocol,
-                  unsigned char type) {
-
-        assert(route);
-        assert(src || src_prefixlen == 0);
-
-        route->src = src ? *src : IN_ADDR_NULL;
-        route->src_prefixlen = src_prefixlen;
-        route->gw = gw ? *gw : IN_ADDR_NULL;
-        route->prefsrc = prefsrc ? *prefsrc : IN_ADDR_NULL;
-        route->scope = scope;
-        route->protocol = protocol;
-        route->type = type;
-}
-
 static int route_remove_handler(sd_netlink *rtnl, sd_netlink_message *m, Link *link) {
         int r;
 
@@ -501,7 +401,7 @@ static int route_remove_handler(sd_netlink *rtnl, sd_netlink_message *m, Link *l
 
         r = sd_netlink_message_get_errno(m);
         if (r < 0 && r != -ESRCH)
-                log_link_warning_errno(link, r, "Could not drop route: %m");
+                log_link_message_warning_errno(link, m, r, "Could not drop route, ignoring");
 
         return 1;
 }
@@ -612,11 +512,93 @@ int route_expire_handler(sd_event_source *s, uint64_t usec, void *userdata) {
 
         r = route_remove(route, route->link, NULL);
         if (r < 0)
-                log_warning_errno(r, "Could not remove route: %m");
+                log_link_warning_errno(route->link, r, "Could not remove route: %m");
         else
                 route_free(route);
 
         return 1;
+}
+
+static int append_nexthop_one(Route *route, MultipathRoute *m, struct rtattr **rta, size_t offset) {
+        struct rtnexthop *rtnh;
+        struct rtattr *new_rta;
+        int r;
+
+        assert(route);
+        assert(m);
+        assert(rta);
+        assert(*rta);
+
+        new_rta = realloc(*rta, RTA_ALIGN((*rta)->rta_len) + RTA_SPACE(sizeof(struct rtnexthop)));
+        if (!new_rta)
+                return -ENOMEM;
+        *rta = new_rta;
+
+        rtnh = (struct rtnexthop *)((uint8_t *) *rta + offset);
+        *rtnh = (struct rtnexthop) {
+                .rtnh_len = sizeof(*rtnh),
+                .rtnh_ifindex = m->ifindex,
+                .rtnh_hops = m->weight > 0 ? m->weight - 1 : 0,
+        };
+
+        (*rta)->rta_len += sizeof(struct rtnexthop);
+
+        if (route->family == m->gateway.family) {
+                r = rtattr_append_attribute(rta, RTA_GATEWAY, &m->gateway.address, FAMILY_ADDRESS_SIZE(m->gateway.family));
+                if (r < 0)
+                        goto clear;
+                rtnh = (struct rtnexthop *)((uint8_t *) *rta + offset);
+                rtnh->rtnh_len += RTA_SPACE(FAMILY_ADDRESS_SIZE(m->gateway.family));
+        } else {
+                r = rtattr_append_attribute(rta, RTA_VIA, &m->gateway, FAMILY_ADDRESS_SIZE(m->gateway.family) + sizeof(m->gateway.family));
+                if (r < 0)
+                        goto clear;
+                rtnh = (struct rtnexthop *)((uint8_t *) *rta + offset);
+                rtnh->rtnh_len += RTA_SPACE(FAMILY_ADDRESS_SIZE(m->gateway.family) + sizeof(m->gateway.family));
+        }
+
+        return 0;
+
+clear:
+        (*rta)->rta_len -= sizeof(struct rtnexthop);
+        return r;
+}
+
+static int append_nexthops(Route *route, sd_netlink_message *req) {
+        _cleanup_free_ struct rtattr *rta = NULL;
+        struct rtnexthop *rtnh;
+        MultipathRoute *m;
+        size_t offset;
+        Iterator i;
+        int r;
+
+        if (ordered_set_isempty(route->multipath_routes))
+                return 0;
+
+        rta = new(struct rtattr, 1);
+        if (!rta)
+                return -ENOMEM;
+
+        *rta = (struct rtattr) {
+                .rta_type = RTA_MULTIPATH,
+                .rta_len = RTA_LENGTH(0),
+        };
+        offset = (uint8_t *) RTA_DATA(rta) - (uint8_t *) rta;
+
+        ORDERED_SET_FOREACH(m, route->multipath_routes, i) {
+                r = append_nexthop_one(route, m, &rta, offset);
+                if (r < 0)
+                        return r;
+
+                rtnh = (struct rtnexthop *)((uint8_t *) rta + offset);
+                offset = (uint8_t *) RTNH_NEXT(rtnh) - (uint8_t *) rta;
+        }
+
+        r = sd_netlink_message_append_data(req, RTA_MULTIPATH, RTA_DATA(rta), RTA_PAYLOAD(rta));
+        if (r < 0)
+                return r;
+
+        return 0;
 }
 
 int route_configure(
@@ -626,7 +608,6 @@ int route_configure(
 
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req = NULL;
         _cleanup_(sd_event_source_unrefp) sd_event_source *expire = NULL;
-        usec_t lifetime;
         int r;
 
         assert(link);
@@ -636,7 +617,7 @@ int route_configure(
         assert(IN_SET(route->family, AF_INET, AF_INET6));
         assert(callback);
 
-        if (route_get(link, route->family, &route->dst, route->dst_prefixlen, &route->gw, route->tos, route->priority, route->table, NULL) <= 0 &&
+        if (route_get(link, route, NULL) <= 0 &&
             set_size(link->routes) >= routes_max())
                 return log_link_error_errno(link, SYNTHETIC_ERRNO(E2BIG),
                                             "Too many routes are configured, refusing: %m");
@@ -680,7 +661,7 @@ int route_configure(
                         return log_link_error_errno(link, r, "Could not set route family: %m");
         }
 
-        if (route->dst_prefixlen) {
+        if (route->dst_prefixlen > 0) {
                 r = netlink_message_append_in_addr_union(req, RTA_DST, route->family, &route->dst);
                 if (r < 0)
                         return log_link_error_errno(link, r, "Could not append RTA_DST attribute: %m");
@@ -690,7 +671,7 @@ int route_configure(
                         return log_link_error_errno(link, r, "Could not set destination prefix length: %m");
         }
 
-        if (route->src_prefixlen) {
+        if (route->src_prefixlen > 0) {
                 r = netlink_message_append_in_addr_union(req, RTA_SRC, route->family, &route->src);
                 if (r < 0)
                         return log_link_error_errno(link, r, "Could not append RTA_SRC attribute: %m");
@@ -803,6 +784,10 @@ int route_configure(
         if (r < 0)
                 return log_link_error_errno(link, r, "Could not append RTA_METRICS attribute: %m");
 
+        r = append_nexthops(route, req);
+        if (r < 0)
+                return log_link_error_errno(link, r, "Could not append RTA_MULTIPATH attribute: %m");
+
         r = netlink_call_async(link->manager->rtnl, NULL, req, callback,
                                link_netlink_destroy_callback, link);
         if (r < 0)
@@ -810,15 +795,11 @@ int route_configure(
 
         link_ref(link);
 
-        lifetime = route->lifetime;
-
-        r = route_add(link, route->family, &route->dst, route->dst_prefixlen, &route->gw, route->tos, route->priority, route->table, &route);
+        r = route_add(link, route, &route);
         if (r < 0)
                 return log_link_error_errno(link, r, "Could not add route: %m");
 
         /* TODO: drop expiration handling once it can be pushed into the kernel */
-        route->lifetime = lifetime;
-
         if (route->lifetime != USEC_INFINITY && !kernel_route_expiration_supported()) {
                 r = sd_event_add_time(link->manager->event, &expire, clock_boottime_or_monotonic(),
                                       route->lifetime, 0, route_expire_handler, route);
@@ -876,11 +857,10 @@ int network_add_default_route_on_device(Network *network) {
         if (r < 0)
                 return r;
 
-        r = in_addr_from_string(AF_INET, "169.254.0.0", &n->dst);
-        if (r < 0)
-                return r;
-
         n->family = AF_INET;
+        n->scope = RT_SCOPE_LINK;
+        n->scope_set = true;
+        n->protocol = RTPROT_STATIC;
 
         TAKE_PTR(n);
         return 0;
@@ -1019,10 +999,19 @@ int config_parse_gateway(
                 /* we are not in an Route section, so treat
                  * this as the special '0' section */
                 r = route_new_static(network, NULL, 0, &n);
-        } else
+                if (r < 0)
+                        return r;
+        } else {
                 r = route_new_static(network, filename, section_line, &n);
-        if (r < 0)
-                return r;
+                if (r < 0)
+                        return r;
+
+                if (streq(rvalue, "_dhcp")) {
+                        n->gateway_from_dhcp = true;
+                        TAKE_PTR(n);
+                        return 0;
+                }
+        }
 
         if (n->family == AF_UNSPEC)
                 r = in_addr_from_string_auto(rvalue, &n->family, &n->gw);
@@ -1589,6 +1578,114 @@ int config_parse_route_ttl_propagate(
         return 0;
 }
 
+int config_parse_multipath_route(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        _cleanup_(route_free_or_set_invalidp) Route *n = NULL;
+        _cleanup_free_ char *word = NULL, *buf = NULL;
+        _cleanup_free_ MultipathRoute *m = NULL;
+        Network *network = userdata;
+        const char *p, *ip, *dev;
+        union in_addr_union a;
+        int family, r;
+
+        assert(filename);
+        assert(section);
+        assert(lvalue);
+        assert(rvalue);
+        assert(data);
+
+        r = route_new_static(network, filename, section_line, &n);
+        if (r < 0)
+                return r;
+
+        if (isempty(rvalue)) {
+                n->multipath_routes = ordered_set_free_free(n->multipath_routes);
+                return 0;
+        }
+
+        m = new0(MultipathRoute, 1);
+        if (!m)
+                return log_oom();
+
+        p = rvalue;
+        r = extract_first_word(&p, &word, NULL, 0);
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r <= 0) {
+                log_syntax(unit, LOG_ERR, filename, line, r,
+                           "Invalid multipath route option, ignoring assignment: %s", rvalue);
+                return 0;
+        }
+
+        dev = strchr(word, '@');
+        if (dev) {
+                buf = strndup(word, dev - word);
+                if (!buf)
+                        return log_oom();
+                ip = buf;
+                dev++;
+        } else
+                ip = word;
+
+        r = in_addr_from_string_auto(ip, &family, &a);
+        if (r < 0) {
+                log_syntax(unit, LOG_ERR, filename, line, r,
+                           "Invalid multipath route gateway '%s', ignoring assignment: %m", rvalue);
+                return 0;
+        }
+        m->gateway.address = a;
+        m->gateway.family = family;
+
+        if (dev) {
+                r = resolve_interface(NULL, dev);
+                if (r < 0) {
+                        log_syntax(unit, LOG_ERR, filename, line, r,
+                                   "Invalid interface name or index, ignoring assignment: %s", dev);
+                        return 0;
+                }
+                m->ifindex = r;
+        }
+
+        if (!isempty(p)) {
+                r = safe_atou32(p, &m->weight);
+                if (r < 0) {
+                        log_syntax(unit, LOG_ERR, filename, line, r,
+                                   "Invalid multipath route weight, ignoring assignment: %s", p);
+                        return 0;
+                }
+                if (m->weight == 0 || m->weight > 256) {
+                        log_syntax(unit, LOG_ERR, filename, line, 0,
+                                   "Invalid multipath route weight, ignoring assignment: %s", p);
+                        return 0;
+                }
+        }
+
+        r = ordered_set_ensure_allocated(&n->multipath_routes, NULL);
+        if (r < 0)
+                return log_oom();
+
+        r = ordered_set_put(n->multipath_routes, m);
+        if (r < 0) {
+                log_syntax(unit, LOG_ERR, filename, line, r,
+                           "Failed to store multipath route, ignoring assignment: %m");
+                return 0;
+        }
+
+        TAKE_PTR(m);
+        TAKE_PTR(n);
+        return 0;
+}
+
 int route_section_verify(Route *route, Network *network) {
         if (section_is_invalid(route->section))
                 return -EINVAL;
@@ -1603,16 +1700,19 @@ int route_section_verify(Route *route, Network *network) {
                                          route->section->filename, route->section->line);
         }
 
-        if (route->family != AF_INET6) {
-                if (!route->table_set && IN_SET(route->type, RTN_LOCAL, RTN_BROADCAST, RTN_ANYCAST, RTN_NAT))
-                        route->table = RT_TABLE_LOCAL;
+        if (!route->table_set && network->vrf) {
+                route->table = VRF(network->vrf)->table;
+                route->table_set = true;
+        }
 
-                if (!route->scope_set) {
-                        if (IN_SET(route->type, RTN_LOCAL, RTN_NAT))
-                                route->scope = RT_SCOPE_HOST;
-                        else if (IN_SET(route->type, RTN_BROADCAST, RTN_ANYCAST))
-                                route->scope = RT_SCOPE_LINK;
-                }
+        if (!route->table_set && IN_SET(route->type, RTN_LOCAL, RTN_BROADCAST, RTN_ANYCAST, RTN_NAT))
+                route->table = RT_TABLE_LOCAL;
+
+        if (!route->scope_set && route->family != AF_INET6) {
+                if (IN_SET(route->type, RTN_LOCAL, RTN_NAT))
+                        route->scope = RT_SCOPE_HOST;
+                else if (IN_SET(route->type, RTN_BROADCAST, RTN_ANYCAST, RTN_MULTICAST))
+                        route->scope = RT_SCOPE_LINK;
         }
 
         if (network->n_static_addresses == 0 &&

@@ -1,10 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
-#include <mntent.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "alloc-util.h"
 #include "device-nodes.h"
@@ -21,7 +19,7 @@ int fstab_has_fstype(const char *fstype) {
         _cleanup_endmntent_ FILE *f = NULL;
         struct mntent *m;
 
-        f = setmntent("/etc/fstab", "re");
+        f = setmntent(fstab_path(), "re");
         if (!f)
                 return errno == ENOENT ? false : -errno;
 
@@ -37,11 +35,35 @@ int fstab_has_fstype(const char *fstype) {
         return false;
 }
 
+bool fstab_is_extrinsic(const char *mount, const char *opts) {
+
+        /* Don't bother with the OS data itself */
+        if (PATH_IN_SET(mount,
+                        "/",
+                        "/usr",
+                        "/etc"))
+                return true;
+
+        if (PATH_STARTSWITH_SET(mount,
+                                "/run/initramfs",    /* This should stay around from before we boot until after we shutdown */
+                                "/proc",             /* All of this is API VFS */
+                                "/sys",              /* … dito … */
+                                "/dev"))             /* … dito … */
+                return true;
+
+        /* If this is an initrd mount, and we are not in the initrd, then leave
+         * this around forever, too. */
+        if (opts && fstab_test_option(opts, "x-initrd.mount\0") && !in_initrd())
+                return true;
+
+        return false;
+}
+
 int fstab_is_mount_point(const char *mount) {
         _cleanup_endmntent_ FILE *f = NULL;
         struct mntent *m;
 
-        f = setmntent("/etc/fstab", "re");
+        f = setmntent(fstab_path(), "re");
         if (!f)
                 return errno == ENOENT ? false : -errno;
 
@@ -188,8 +210,7 @@ int fstab_extract_values(const char *opts, const char *name, char ***values) {
 
 int fstab_find_pri(const char *options, int *ret) {
         _cleanup_free_ char *opt = NULL;
-        int r;
-        unsigned pri;
+        int r, pri;
 
         assert(ret);
 
@@ -199,14 +220,11 @@ int fstab_find_pri(const char *options, int *ret) {
         if (r == 0 || !opt)
                 return 0;
 
-        r = safe_atou(opt, &pri);
+        r = safe_atoi(opt, &pri);
         if (r < 0)
                 return r;
 
-        if ((int) pri < 0)
-                return -ERANGE;
-
-        *ret = (int) pri;
+        *ret = pri;
         return 1;
 }
 

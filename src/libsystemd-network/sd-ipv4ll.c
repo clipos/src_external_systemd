@@ -7,7 +7,6 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "sd-id128.h"
 #include "sd-ipv4acd.h"
@@ -242,7 +241,7 @@ static int ipv4ll_start_internal(sd_ipv4ll *ll, bool reset_generation) {
                 picked_address = true;
         }
 
-        r = sd_ipv4acd_start(ll->acd);
+        r = sd_ipv4acd_start(ll->acd, reset_generation);
         if (r < 0) {
 
                 /* We couldn't start? If so, let's forget the picked address again, the user might make a change and

@@ -132,7 +132,7 @@ void session_add_to_gc_queue(Session *s);
 int session_activate(Session *s);
 bool session_is_active(Session *s);
 int session_get_idle_hint(Session *s, dual_timestamp *t);
-void session_set_idle_hint(Session *s, bool b);
+int session_set_idle_hint(Session *s, bool b);
 int session_get_locked_hint(Session *s);
 void session_set_locked_hint(Session *s, bool b);
 int session_create_fifo(Session *s);
@@ -161,7 +161,6 @@ KillWho kill_who_from_string(const char *s) _pure_;
 const char* tty_validity_to_string(TTYValidity t) _const_;
 TTYValidity tty_validity_from_string(const char *s) _pure_;
 
-int session_prepare_vt(Session *s);
 void session_leave_vt(Session *s);
 
 bool session_is_controller(Session *s, const char *sender);

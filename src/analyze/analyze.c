@@ -5,7 +5,6 @@
 
 #include <getopt.h>
 #include <inttypes.h>
-#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -85,6 +84,7 @@ static bool arg_man = true;
 static bool arg_generators = false;
 static const char *arg_root = NULL;
 static unsigned arg_iterations = 1;
+static usec_t arg_base_time = USEC_INFINITY;
 
 STATIC_DESTRUCTOR_REGISTER(arg_dot_from_patterns, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_dot_to_patterns, strv_freep);
@@ -1101,7 +1101,7 @@ static int analyze_blame(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return r;
 
-        r = table_set_sort(table, 0, SIZE_MAX);
+        r = table_set_sort(table, (size_t) 0, (size_t) SIZE_MAX);
         if (r < 0)
                 return r;
 
@@ -1113,13 +1113,11 @@ static int analyze_blame(int argc, char *argv[], void *userdata) {
                 if (u->time <= 0)
                         continue;
 
-                r = table_add_cell(table, NULL, TABLE_TIMESPAN_MSEC, &u->time);
+                r = table_add_many(table,
+                                   TABLE_TIMESPAN_MSEC, u->time,
+                                   TABLE_STRING, u->name);
                 if (r < 0)
-                        return r;
-
-                r = table_add_cell(table, NULL, TABLE_STRING, u->name);
-                if (r < 0)
-                        return r;
+                        return table_log_add_error(r);
         }
 
         (void) pager_open(arg_pager_flags);
@@ -1162,9 +1160,9 @@ static int graph_one_property(
         assert(prop);
         assert(color);
 
-        match_patterns = strv_fnmatch(patterns, u->id, 0);
+        match_patterns = strv_fnmatch(patterns, u->id);
 
-        if (!strv_isempty(from_patterns) && !match_patterns && !strv_fnmatch(from_patterns, u->id, 0))
+        if (!strv_isempty(from_patterns) && !match_patterns && !strv_fnmatch(from_patterns, u->id))
                 return 0;
 
         r = bus_get_unit_property_strv(bus, u->unit_path, prop, &units);
@@ -1174,9 +1172,9 @@ static int graph_one_property(
         STRV_FOREACH(unit, units) {
                 bool match_patterns2;
 
-                match_patterns2 = strv_fnmatch(patterns, *unit, 0);
+                match_patterns2 = strv_fnmatch(patterns, *unit);
 
-                if (!strv_isempty(to_patterns) && !match_patterns2 && !strv_fnmatch(to_patterns, *unit, 0))
+                if (!strv_isempty(to_patterns) && !match_patterns2 && !strv_fnmatch(to_patterns, *unit))
                         continue;
 
                 if (!strv_isempty(patterns) && !match_patterns && !match_patterns2)
@@ -1630,7 +1628,7 @@ static int dump_exit_status(int argc, char *argv[], void *userdata) {
                                            TABLE_INT, (int) i,
                                            TABLE_STRING, exit_status_class(i));
                         if (r < 0)
-                                return r;
+                                return table_log_add_error(r);
                 }
         else
                 for (int i = 1; i < argc; i++) {
@@ -1646,7 +1644,7 @@ static int dump_exit_status(int argc, char *argv[], void *userdata) {
                                            TABLE_INT, status,
                                            TABLE_STRING, exit_status_class(status) ?: "-");
                         if (r < 0)
-                                return r;
+                                return table_log_add_error(r);
                 }
 
         (void) pager_open(arg_pager_flags);
@@ -1853,33 +1851,23 @@ static int dump_timespan(int argc, char *argv[], void *userdata) {
                 if (r < 0)
                         return r;
 
-                r = table_add_cell(table, NULL, TABLE_STRING, "Original:");
+                r = table_add_many(table,
+                                   TABLE_STRING, "Original:",
+                                   TABLE_STRING, *input_timespan);
                 if (r < 0)
-                        return r;
-
-                r = table_add_cell(table, NULL, TABLE_STRING, *input_timespan);
-                if (r < 0)
-                        return r;
+                        return table_log_add_error(r);
 
                 r = table_add_cell_stringf(table, NULL, "%ss:", special_glyph(SPECIAL_GLYPH_MU));
                 if (r < 0)
-                        return r;
+                        return table_log_add_error(r);
 
-                r = table_add_cell(table, NULL, TABLE_UINT64, &output_usecs);
+                r = table_add_many(table,
+                                   TABLE_UINT64, output_usecs,
+                                   TABLE_STRING, "Human:",
+                                   TABLE_TIMESPAN, output_usecs,
+                                   TABLE_SET_COLOR, ansi_highlight());
                 if (r < 0)
-                        return r;
-
-                r = table_add_cell(table, NULL, TABLE_STRING, "Human:");
-                if (r < 0)
-                        return r;
-
-                r = table_add_cell(table, &cell, TABLE_TIMESPAN, &output_usecs);
-                if (r < 0)
-                        return r;
-
-                r = table_set_color(table, cell, ansi_highlight());
-                if (r < 0)
-                        return r;
+                        return table_log_add_error(r);
 
                 r = table_print(table, NULL);
                 if (r < 0)
@@ -1925,57 +1913,42 @@ static int test_timestamp_one(const char *p) {
         if (r < 0)
                 return r;
 
-        r = table_add_cell(table, NULL, TABLE_STRING, "Original form:");
+        r = table_add_many(table,
+                           TABLE_STRING, "Original form:",
+                           TABLE_STRING, p,
+                           TABLE_STRING, "Normalized form:",
+                           TABLE_TIMESTAMP, usec,
+                           TABLE_SET_COLOR, ansi_highlight_blue());
         if (r < 0)
-                return r;
-
-        r = table_add_cell(table, NULL, TABLE_STRING, p);
-        if (r < 0)
-                return r;
-
-        r = table_add_cell(table, NULL, TABLE_STRING, "Normalized form:");
-        if (r < 0)
-                return r;
-
-        r = table_add_cell(table, &cell, TABLE_TIMESTAMP, &usec);
-        if (r < 0)
-                return r;
-
-        r = table_set_color(table, cell, ansi_highlight_blue());
-        if (r < 0)
-                return r;
+                return table_log_add_error(r);
 
         if (!in_utc_timezone()) {
-                r = table_add_cell(table, NULL, TABLE_STRING, "(in UTC):");
+                r = table_add_many(table,
+                                   TABLE_STRING, "(in UTC):",
+                                   TABLE_TIMESTAMP_UTC, usec);
                 if (r < 0)
-                        return r;
-
-                r = table_add_cell(table, &cell, TABLE_TIMESTAMP_UTC, &usec);
-                if (r < 0)
-                        return r;
+                        return table_log_add_error(r);
         }
 
         r = table_add_cell(table, NULL, TABLE_STRING, "UNIX seconds:");
         if (r < 0)
-                return r;
+                return table_log_add_error(r);
 
         if (usec % USEC_PER_SEC == 0)
-                r = table_add_cell_stringf(table, &cell, "@%"PRI_USEC,
+                r = table_add_cell_stringf(table, NULL, "@%"PRI_USEC,
                                            usec / USEC_PER_SEC);
         else
-                r = table_add_cell_stringf(table, &cell, "@%"PRI_USEC".%06"PRI_USEC"",
+                r = table_add_cell_stringf(table, NULL, "@%"PRI_USEC".%06"PRI_USEC"",
                                            usec / USEC_PER_SEC,
                                            usec % USEC_PER_SEC);
         if (r < 0)
                 return r;
 
-        r = table_add_cell(table, NULL, TABLE_STRING, "From now:");
+        r = table_add_many(table,
+                           TABLE_STRING, "From now:",
+                           TABLE_TIMESTAMP_RELATIVE, usec);
         if (r < 0)
-                return r;
-
-        r = table_add_cell(table, &cell, TABLE_TIMESTAMP_RELATIVE, &usec);
-        if (r < 0)
-                return r;
+                return table_log_add_error(r);
 
         return table_print(table, NULL);
 }
@@ -2035,22 +2008,18 @@ static int test_calendar_one(usec_t n, const char *p) {
                 return r;
 
         if (!streq(t, p)) {
-                r = table_add_cell(table, NULL, TABLE_STRING, "Original form:");
+                r = table_add_many(table,
+                                   TABLE_STRING, "Original form:",
+                                   TABLE_STRING, p);
                 if (r < 0)
-                        return r;
-
-                r = table_add_cell(table, NULL, TABLE_STRING, p);
-                if (r < 0)
-                        return r;
+                        return table_log_add_error(r);
         }
 
-        r = table_add_cell(table, NULL, TABLE_STRING, "Normalized form:");
+        r = table_add_many(table,
+                           TABLE_STRING, "Normalized form:",
+                           TABLE_STRING, t);
         if (r < 0)
-                return r;
-
-        r = table_add_cell(table, NULL, TABLE_STRING, t);
-        if (r < 0)
-                return r;
+                return table_log_add_error(r);
 
         for (unsigned i = 0; i < arg_iterations; i++) {
                 usec_t next;
@@ -2058,17 +2027,12 @@ static int test_calendar_one(usec_t n, const char *p) {
                 r = calendar_spec_next_usec(spec, n, &next);
                 if (r == -ENOENT) {
                         if (i == 0) {
-                                r = table_add_cell(table, NULL, TABLE_STRING, "Next elapse:");
+                                r = table_add_many(table,
+                                                   TABLE_STRING, "Next elapse:",
+                                                   TABLE_STRING, "never",
+                                                   TABLE_SET_COLOR, ansi_highlight_yellow());
                                 if (r < 0)
-                                        return r;
-
-                                r = table_add_cell(table, &cell, TABLE_STRING, "never");
-                                if (r < 0)
-                                        return r;
-
-                                r = table_set_color(table, cell, ansi_highlight_yellow());
-                                if (r < 0)
-                                        return r;
+                                        return table_log_add_error(r);
                         }
                         break;
                 }
@@ -2076,17 +2040,12 @@ static int test_calendar_one(usec_t n, const char *p) {
                         return log_error_errno(r, "Failed to determine next elapse for '%s': %m", p);
 
                 if (i == 0) {
-                        r = table_add_cell(table, NULL, TABLE_STRING, "Next elapse:");
+                        r = table_add_many(table,
+                                           TABLE_STRING, "Next elapse:",
+                                           TABLE_TIMESTAMP, next,
+                                           TABLE_SET_COLOR, ansi_highlight_blue());
                         if (r < 0)
-                                return r;
-
-                        r = table_add_cell(table, &cell, TABLE_TIMESTAMP, &next);
-                        if (r < 0)
-                                return r;
-
-                        r = table_set_color(table, cell, ansi_highlight_blue());
-                        if (r < 0)
-                                return r;
+                                return table_log_add_error(r);
                 } else {
                         int k = DECIMAL_STR_WIDTH(i + 1);
 
@@ -2097,34 +2056,28 @@ static int test_calendar_one(usec_t n, const char *p) {
 
                         r = table_add_cell_stringf(table, NULL, "Iter. #%u:", i+1);
                         if (r < 0)
-                                return r;
+                                return table_log_add_error(r);
 
-                        r = table_add_cell(table, &cell, TABLE_TIMESTAMP, &next);
+                        r = table_add_many(table,
+                                           TABLE_TIMESTAMP, next,
+                                           TABLE_SET_COLOR, ansi_highlight_blue());
                         if (r < 0)
-                                return r;
-
-                        r = table_set_color(table, cell, ansi_highlight_blue());
-                        if (r < 0)
-                                return r;
+                                return table_log_add_error(r);
                 }
 
                 if (!in_utc_timezone()) {
-                        r = table_add_cell(table, NULL, TABLE_STRING, "(in UTC):");
+                        r = table_add_many(table,
+                                           TABLE_STRING, "(in UTC):",
+                                           TABLE_TIMESTAMP_UTC, next);
                         if (r < 0)
-                                return r;
-
-                        r = table_add_cell(table, NULL, TABLE_TIMESTAMP_UTC, &next);
-                        if (r < 0)
-                                return r;
+                                return table_log_add_error(r);
                 }
 
-                r = table_add_cell(table, NULL, TABLE_STRING, "From now:");
+                r = table_add_many(table,
+                                   TABLE_STRING, "From now:",
+                                   TABLE_TIMESTAMP_RELATIVE, next);
                 if (r < 0)
-                        return r;
-
-                r = table_add_cell(table, NULL, TABLE_TIMESTAMP_RELATIVE, &next);
-                if (r < 0)
-                        return r;
+                        return table_log_add_error(r);
 
                 n = next;
         }
@@ -2137,7 +2090,10 @@ static int test_calendar(int argc, char *argv[], void *userdata) {
         char **p;
         usec_t n;
 
-        n = now(CLOCK_REALTIME); /* We want to use the same "base" for all expressions */
+        if (arg_base_time != USEC_INFINITY)
+                n = arg_base_time;
+        else
+                n = now(CLOCK_REALTIME); /* We want to use the same "base" for all expressions */
 
         STRV_FOREACH(p, strv_skip(argv, 1)) {
                 r = test_calendar_one(n, *p);
@@ -2163,8 +2119,8 @@ static int service_watchdogs(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return log_error_errno(r, "Failed to create bus connection: %m");
 
-        /* get ServiceWatchdogs */
         if (argc == 1) {
+                /* get ServiceWatchdogs */
                 r = sd_bus_get_property_trivial(
                                 bus,
                                 "org.freedesktop.systemd1",
@@ -2179,27 +2135,24 @@ static int service_watchdogs(int argc, char *argv[], void *userdata) {
 
                 printf("%s\n", yes_no(!!b));
 
-                return 0;
-        }
+        } else {
+                /* set ServiceWatchdogs */
+                b = parse_boolean(argv[1]);
+                if (b < 0)
+                        return log_error_errno(b, "Failed to parse service-watchdogs argument: %m");
 
-        /* set ServiceWatchdogs */
-        b = parse_boolean(argv[1]);
-        if (b < 0) {
-                log_error("Failed to parse service-watchdogs argument.");
-                return -EINVAL;
+                r = sd_bus_set_property(
+                                bus,
+                                "org.freedesktop.systemd1",
+                                "/org/freedesktop/systemd1",
+                                "org.freedesktop.systemd1.Manager",
+                                "ServiceWatchdogs",
+                                &error,
+                                "b",
+                                b);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to set service-watchdog state: %s", bus_error_message(&error, r));
         }
-
-        r = sd_bus_set_property(
-                        bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "ServiceWatchdogs",
-                        &error,
-                        "b",
-                        b);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set service-watchdog state: %s", bus_error_message(&error, r));
 
         return 0;
 }
@@ -2240,8 +2193,27 @@ static int help(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return log_oom();
 
-        printf("%s [OPTIONS...] {COMMAND} ...\n\n"
-               "Profile systemd, show unit dependencies, check unit files.\n\n"
+        printf("%s [OPTIONS...] COMMAND ...\n\n"
+               "%sProfile systemd, show unit dependencies, check unit files.%s\n"
+               "\nCommands:\n"
+               "  [time]                   Print time required to boot the machine\n"
+               "  blame                    Print list of running units ordered by time to init\n"
+               "  critical-chain [UNIT...] Print a tree of the time critical chain of units\n"
+               "  plot                     Output SVG graphic showing service initialization\n"
+               "  dot [UNIT...]            Output dependency graph in %s format\n"
+               "  dump                     Output state serialization of service manager\n"
+               "  cat-config               Show configuration file and drop-ins\n"
+               "  unit-files               List files and symlinks for units\n"
+               "  unit-paths               List load directories for units\n"
+               "  exit-status [STATUS...]  List exit status definitions\n"
+               "  syscall-filter [NAME...] Print list of syscalls in seccomp filter\n"
+               "  condition CONDITION...   Evaluate conditions and asserts\n"
+               "  verify FILE...           Check unit files for correctness\n"
+               "  calendar SPEC...         Validate repetitive calendar time events\n"
+               "  timestamp TIMESTAMP...   Validate a timestamp\n"
+               "  timespan SPAN...         Validate a time span\n"
+               "  security [UNIT...]       Analyze security of unit\n"
+               "\nOptions:\n"
                "  -h --help                Show this help\n"
                "     --version             Show package version\n"
                "     --no-pager            Do not pipe output into a pager\n"
@@ -2259,29 +2231,11 @@ static int help(int argc, char *argv[], void *userdata) {
                "     --man[=BOOL]          Do [not] check for existence of man pages\n"
                "     --generators[=BOOL]   Do [not] run unit generators (requires privileges)\n"
                "     --iterations=N        Show the specified number of iterations\n"
-               "\nCommands:\n"
-               "  time                     Print time spent in the kernel\n"
-               "  blame                    Print list of running units ordered by time to init\n"
-               "  critical-chain [UNIT...] Print a tree of the time critical chain of units\n"
-               "  plot                     Output SVG graphic showing service initialization\n"
-               "  dot [UNIT...]            Output dependency graph in %s format\n"
-               "  log-level [LEVEL]        Get/set logging threshold for manager\n"
-               "  log-target [TARGET]      Get/set logging target for manager\n"
-               "  dump                     Output state serialization of service manager\n"
-               "  cat-config               Show configuration file and drop-ins\n"
-               "  unit-files               List files and symlinks for units\n"
-               "  unit-paths               List load directories for units\n"
-               "  exit-status [STATUS...]  List exit status definitions\n"
-               "  syscall-filter [NAME...] Print list of syscalls in seccomp filter\n"
-               "  condition CONDITION...   Evaluate conditions and asserts\n"
-               "  verify FILE...           Check unit files for correctness\n"
-               "  service-watchdogs [BOOL] Get/set service watchdog state\n"
-               "  calendar SPEC...         Validate repetitive calendar time events\n"
-               "  timestamp TIMESTAMP...   Validate a timestamp\n"
-               "  timespan SPAN...         Validate a time span\n"
-               "  security [UNIT...]       Analyze security of unit\n"
+               "     --base-time=TIMESTAMP Calculate calendar times relative to specified time\n"
                "\nSee the %s for details.\n"
                , program_invocation_short_name
+               , ansi_highlight()
+               , ansi_normal()
                , dot_link
                , link
         );
@@ -2308,6 +2262,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_MAN,
                 ARG_GENERATORS,
                 ARG_ITERATIONS,
+                ARG_BASE_TIME,
         };
 
         static const struct option options[] = {
@@ -2328,6 +2283,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "host",         required_argument, NULL, 'H'                  },
                 { "machine",      required_argument, NULL, 'M'                  },
                 { "iterations",   required_argument, NULL, ARG_ITERATIONS       },
+                { "base-time",    required_argument, NULL, ARG_BASE_TIME        },
                 {}
         };
 
@@ -2434,6 +2390,13 @@ static int parse_argv(int argc, char *argv[]) {
 
                         break;
 
+                case ARG_BASE_TIME:
+                        r = parse_timestamp(optarg, &arg_base_time);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse --base-time= parameter: %s", optarg);
+
+                        break;
+
                 case '?':
                         return -EINVAL;
 
@@ -2466,14 +2429,14 @@ static int run(int argc, char *argv[]) {
                 { "critical-chain",    VERB_ANY, VERB_ANY, 0,            analyze_critical_chain },
                 { "plot",              VERB_ANY, 1,        0,            analyze_plot           },
                 { "dot",               VERB_ANY, VERB_ANY, 0,            dot                    },
+                /* The following seven verbs are deprecated */
                 { "log-level",         VERB_ANY, 2,        0,            get_or_set_log_level   },
                 { "log-target",        VERB_ANY, 2,        0,            get_or_set_log_target  },
-                /* The following four verbs are deprecated aliases */
                 { "set-log-level",     2,        2,        0,            set_log_level          },
                 { "get-log-level",     VERB_ANY, 1,        0,            get_log_level          },
                 { "set-log-target",    2,        2,        0,            set_log_target         },
                 { "get-log-target",    VERB_ANY, 1,        0,            get_log_target         },
-
+                { "service-watchdogs", VERB_ANY, 2,        0,            service_watchdogs      },
                 { "dump",              VERB_ANY, 1,        0,            dump                   },
                 { "cat-config",        2,        VERB_ANY, 0,            cat_config             },
                 { "unit-files",        VERB_ANY, VERB_ANY, 0,            do_unit_files          },
@@ -2485,7 +2448,6 @@ static int run(int argc, char *argv[]) {
                 { "calendar",          2,        VERB_ANY, 0,            test_calendar          },
                 { "timestamp",         2,        VERB_ANY, 0,            test_timestamp         },
                 { "timespan",          2,        VERB_ANY, 0,            dump_timespan          },
-                { "service-watchdogs", VERB_ANY, 2,        0,            service_watchdogs      },
                 { "security",          VERB_ANY, VERB_ANY, 0,            do_security            },
                 {}
         };

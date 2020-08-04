@@ -6,7 +6,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
 #include <syslog.h>
 
 #include "alloc-util.h"
@@ -91,7 +90,7 @@ int extract_first_word(const char **p, char **ret, const char *separators, Extra
                                 bool eight_bit = false;
                                 char32_t u;
 
-                                r = cunescape_one(*p, (size_t) -1, &u, &eight_bit);
+                                r = cunescape_one(*p, (size_t) -1, &u, &eight_bit, false);
                                 if (r < 0) {
                                         if (flags & EXTRACT_CUNESCAPE_RELAX) {
                                                 s[sz++] = '\\';

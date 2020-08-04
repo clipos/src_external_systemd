@@ -8,6 +8,7 @@
 #include "parse-util.h"
 #include "resolved-conf.h"
 #include "resolved-dnssd.h"
+#include "resolved-util.h"
 #include "specifier.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -23,15 +24,16 @@ static const char* const dns_stub_listener_mode_table[_DNS_STUB_LISTENER_MODE_MA
 };
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(dns_stub_listener_mode, DnsStubListenerMode, DNS_STUB_LISTENER_YES);
 
-int manager_add_dns_server_by_string(Manager *m, DnsServerType type, const char *word) {
+static int manager_add_dns_server_by_string(Manager *m, DnsServerType type, const char *word) {
         union in_addr_union address;
         int family, r, ifindex = 0;
         DnsServer *s;
+        _cleanup_free_ char *server_name = NULL;
 
         assert(m);
         assert(word);
 
-        r = in_addr_ifindex_from_string_auto(word, &family, &address, &ifindex);
+        r = in_addr_ifindex_name_from_string_auto(word, &family, &address, &ifindex, &server_name);
         if (r < 0)
                 return r;
 
@@ -52,7 +54,7 @@ int manager_add_dns_server_by_string(Manager *m, DnsServerType type, const char 
                 return 0;
         }
 
-        return dns_server_new(m, NULL, type, NULL, family, &address, ifindex);
+        return dns_server_new(m, NULL, type, NULL, family, &address, ifindex, server_name);
 }
 
 int manager_parse_dns_server_string_and_warn(Manager *m, DnsServerType type, const char *string) {
@@ -78,7 +80,7 @@ int manager_parse_dns_server_string_and_warn(Manager *m, DnsServerType type, con
         return 0;
 }
 
-int manager_add_search_domain_by_string(Manager *m, const char *domain) {
+static int manager_add_search_domain_by_string(Manager *m, const char *domain) {
         DnsSearchDomain *d;
         bool route_only;
         int r;

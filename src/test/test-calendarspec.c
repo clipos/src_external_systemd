@@ -1,7 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
-#include <string.h>
-
 #include "alloc-util.h"
 #include "calendarspec.h"
 #include "errno-util.h"
@@ -45,9 +43,12 @@ static void test_next(const char *input, const char *new_tz, usec_t after, usec_
         if (old_tz)
                 old_tz = strdupa(old_tz);
 
-        if (new_tz)
-                assert_se(setenv("TZ", new_tz, 1) >= 0);
-        else
+        if (new_tz) {
+                char *colon_tz;
+
+                colon_tz = strjoina(":", new_tz);
+                assert_se(setenv("TZ", colon_tz, 1) >= 0);
+        } else
                 assert_se(unsetenv("TZ") >= 0);
         tzset();
 
@@ -184,6 +185,8 @@ int main(int argc, char* argv[]) {
         test_one("@1493187147 UTC", "2017-04-26 06:12:27 UTC");
         test_one("@0", "1970-01-01 00:00:00 UTC");
         test_one("@0 UTC", "1970-01-01 00:00:00 UTC");
+        test_one("*:05..05", "*-*-* *:05:00");
+        test_one("*:05..10/6", "*-*-* *:05:00");
 
         test_next("2016-03-27 03:17:00", "", 12345, 1459048620000000);
         test_next("2016-03-27 03:17:00", "CET", 12345, 1459041420000000);
@@ -236,8 +239,6 @@ int main(int argc, char* argv[]) {
         assert_se(calendar_spec_from_string("*~29", &c) < 0);
         assert_se(calendar_spec_from_string("*~16..31", &c) < 0);
         assert_se(calendar_spec_from_string("12..1/2-*", &c) < 0);
-        assert_se(calendar_spec_from_string("*:05..05", &c) < 0);
-        assert_se(calendar_spec_from_string("*:05..10/6", &c) < 0);
         assert_se(calendar_spec_from_string("20/4:00", &c) < 0);
         assert_se(calendar_spec_from_string("00:00/60", &c) < 0);
         assert_se(calendar_spec_from_string("00:00:2300", &c) < 0);

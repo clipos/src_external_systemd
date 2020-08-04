@@ -21,7 +21,7 @@ static void do_fstab_filter_options(const char *opts,
 
         int r;
         const char *name;
-        _cleanup_free_ char *value, *filtered;
+        _cleanup_free_ char *value = NULL, *filtered = NULL;
 
         r = fstab_filter_options(opts, remove, &name, &value, &filtered);
         log_info("\"%s\" → %d, \"%s\", \"%s\", \"%s\", expected %d, \"%s\", \"%s\", \"%s\"",
@@ -99,6 +99,9 @@ static void test_fstab_find_pri(void) {
 
         assert_se(fstab_find_pri("pri=11", &pri) == 1);
         assert_se(pri == 11);
+
+        assert_se(fstab_find_pri("pri=-2", &pri) == 1);
+        assert_se(pri == -2);
 
         assert_se(fstab_find_pri("opt,pri=12,opt", &pri) == 1);
         assert_se(pri == 12);

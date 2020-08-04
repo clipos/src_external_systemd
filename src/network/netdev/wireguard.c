@@ -15,7 +15,6 @@
 #include "hexdecoct.h"
 #include "memory-util.h"
 #include "netlink-util.h"
-#include "networkd-link.h"
 #include "networkd-manager.h"
 #include "networkd-util.h"
 #include "parse-util.h"
@@ -220,6 +219,7 @@ static int wireguard_set_interface(NetDev *netdev) {
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *message = NULL;
         WireguardIPmask *mask_start = NULL;
         WireguardPeer *peer, *peer_start;
+        bool sent_once = false;
         uint32_t serial;
         Wireguard *w;
         int r;
@@ -228,7 +228,7 @@ static int wireguard_set_interface(NetDev *netdev) {
         w = WIREGUARD(netdev);
         assert(w);
 
-        for (peer_start = w->peers; peer_start; ) {
+        for (peer_start = w->peers; peer_start || !sent_once; ) {
                 uint16_t i = 0;
 
                 message = sd_netlink_message_unref(message);
@@ -279,6 +279,8 @@ static int wireguard_set_interface(NetDev *netdev) {
                 r = sd_netlink_send(netdev->manager->genl, message, &serial);
                 if (r < 0)
                         return log_netdev_error_errno(netdev, r, "Could not set wireguard device: %m");
+
+                sent_once = true;
         }
 
         return 0;
@@ -901,7 +903,9 @@ static int wireguard_read_key_file(const char *filename, uint8_t dest[static WG_
 
         assert(dest);
 
-        r = read_full_file_full(filename, READ_FULL_FILE_SECURE | READ_FULL_FILE_UNBASE64, &key, &key_len);
+        (void) warn_file_is_world_accessible(filename, NULL, NULL, 0);
+
+        r = read_full_file_full(AT_FDCWD, filename, READ_FULL_FILE_SECURE | READ_FULL_FILE_UNBASE64, &key, &key_len);
         if (r < 0)
                 return r;
 
@@ -966,7 +970,7 @@ static int wireguard_verify(NetDev *netdev, const char *filename) {
 
 const NetDevVTable wireguard_vtable = {
         .object_size = sizeof(Wireguard),
-        .sections = "Match\0NetDev\0WireGuard\0WireGuardPeer\0",
+        .sections = NETDEV_COMMON_SECTIONS "WireGuard\0WireGuardPeer\0",
         .post_create = netdev_wireguard_post_create,
         .init = wireguard_init,
         .done = wireguard_done,

@@ -8,7 +8,6 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "missing.h"
 #include "mountpoint-util.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -264,7 +263,7 @@ int path_is_mount_point(const char *t, const char *root, int flags) {
          * /bin -> /usr/bin/ and /usr is a mount point, then the parent that we
          * look at needs to be /usr, not /. */
         if (flags & AT_SYMLINK_FOLLOW) {
-                r = chase_symlinks(t, root, CHASE_TRAIL_SLASH, &canonical);
+                r = chase_symlinks(t, root, CHASE_TRAIL_SLASH, &canonical, NULL);
                 if (r < 0)
                         return r;
 
@@ -273,7 +272,7 @@ int path_is_mount_point(const char *t, const char *root, int flags) {
 
         fd = open_parent(t, O_PATH|O_CLOEXEC, 0);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return fd_is_mount_point(fd, last_path_component(t), flags);
 }
@@ -311,7 +310,8 @@ bool fstype_is_network(const char *fstype) {
                           "glusterfs",
                           "pvfs2", /* OrangeFS */
                           "ocfs2",
-                          "lustre");
+                          "lustre",
+                          "davfs");
 }
 
 bool fstype_is_api_vfs(const char *fstype) {

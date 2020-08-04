@@ -56,11 +56,17 @@ static int node_vtable_get_userdata(
 static void *vtable_method_convert_userdata(const sd_bus_vtable *p, void *u) {
         assert(p);
 
+        if (!u)
+                return SIZE_TO_PTR(p->x.method.offset); /* don't add offset on NULL, to make ubsan happy */
+
         return (uint8_t*) u + p->x.method.offset;
 }
 
 static void *vtable_property_convert_userdata(const sd_bus_vtable *p, void *u) {
         assert(p);
+
+        if (!u)
+                return SIZE_TO_PTR(p->x.property.offset); /* as above */
 
         return (uint8_t*) u + p->x.property.offset;
 }
@@ -353,6 +359,12 @@ static int method_callbacks_run(
         if (require_fallback && !c->parent->is_fallback)
                 return 0;
 
+        if (FLAGS_SET(c->vtable->flags, SD_BUS_VTABLE_SENSITIVE)) {
+                r = sd_bus_message_sensitive(m);
+                if (r < 0)
+                        return r;
+        }
+
         r = check_access(bus, m, c, &error);
         if (r < 0)
                 return bus_maybe_reply_error(m, r, &error);
@@ -577,6 +589,12 @@ static int property_get_set_callbacks_run(
         if (require_fallback && !c->parent->is_fallback)
                 return 0;
 
+        if (FLAGS_SET(c->vtable->flags, SD_BUS_VTABLE_SENSITIVE)) {
+                r = sd_bus_message_sensitive(m);
+                if (r < 0)
+                        return r;
+        }
+
         r = vtable_property_get_userdata(bus, m->path, c, &u, &error);
         if (r <= 0)
                 return bus_maybe_reply_error(m, r, &error);
@@ -590,6 +608,12 @@ static int property_get_set_callbacks_run(
         r = sd_bus_message_new_method_return(m, &reply);
         if (r < 0)
                 return r;
+
+        if (FLAGS_SET(c->vtable->flags, SD_BUS_VTABLE_SENSITIVE)) {
+                r = sd_bus_message_sensitive(reply);
+                if (r < 0)
+                        return r;
+        }
 
         if (is_get) {
                 /* Note that we do not protect against reexecution
@@ -692,6 +716,12 @@ static int vtable_append_one_property(
         assert(c);
         assert(v);
 
+        if (FLAGS_SET(c->vtable->flags, SD_BUS_VTABLE_SENSITIVE)) {
+                r = sd_bus_message_sensitive(reply);
+                if (r < 0)
+                        return r;
+        }
+
         r = sd_bus_message_open_container(reply, 'e', "sv");
         if (r < 0)
                 return r;
@@ -750,7 +780,16 @@ static int vtable_append_all_properties(
                 if (v->flags & SD_BUS_VTABLE_HIDDEN)
                         continue;
 
+                /* Let's not include properties marked as "explicit" in any message that contians a generic
+                 * dump of properties, but only in those generated as a response to an explicit request. */
                 if (v->flags & SD_BUS_VTABLE_PROPERTY_EXPLICIT)
+                        continue;
+
+                /* Let's not include properties marked only for invalidation on change (i.e. in contrast to
+                 * those whose new values are included in PropertiesChanges message) in any signals. This is
+                 * useful to ensure they aren't included in InterfacesAdded messages. */
+                if (reply->header->type != SD_BUS_MESSAGE_METHOD_RETURN &&
+                    FLAGS_SET(v->flags, SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION))
                         continue;
 
                 r = vtable_append_one_property(bus, reply, path, c, v, userdata, error);

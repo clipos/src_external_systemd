@@ -33,39 +33,45 @@
     <para><literallayout><filename>~/.config/user-tmpfiles.d/*.conf</filename>
 <filename>$XDG_RUNTIME_DIR/user-tmpfiles.d/*.conf</filename>
 <filename>~/.local/share/user-tmpfiles.d/*.conf</filename>
-<filename>…</filename>
+<filename index='false'>…</filename>
 <filename>/usr/share/user-tmpfiles.d/*.conf</filename>
     </literallayout></para>
 
     <programlisting>#Type Path                                     Mode User Group Age         Argument
 f     /file/to/create                          mode user group -           content
-F     /file/to/create-or-truncate              mode user group -           content
+f+    /file/to/create-or-truncate              mode user group -           content
 w     /file/to/write-to                        -    -    -     -           content
+w+    /file/to/append-to                       -    -    -     -           content
 d     /directory/to/create-and-cleanup         mode user group cleanup-age -
 D     /directory/to/create-and-remove          mode user group cleanup-age -
 e     /directory/to/cleanup                    mode user group cleanup-age -
-v     /subvolume/to/create                     mode user group -           -
 v     /subvolume-or-directory/to/create        mode user group -           -
-Q     /subvolume/to/create                     mode user group -           -
+q     /subvolume-or-directory/to/create        mode user group -           -
+Q     /subvolume-or-directory/to/create        mode user group -           -
 p     /fifo/to/create                          mode user group -           -
+p+    /fifo/to/[re]create                      mode user group -           -
 L     /symlink/to/create                       -    -    -     -           symlink/target/path
-c     /dev/char-device-to-create               mode user group -           -
-b     /dev/block-device-to-create              mode user group -           -
-# p+, L+, c+, b+ create target unconditionally
+L+    /symlink/to/[re]create                   -    -    -     -           symlink/target/path
+c     /dev/char-device-to-create               mode user group -           major:minor
+c+    /dev/char-device-to-[re]create           mode user group -           major:minor
+b     /dev/block-device-to-create              mode user group -           major:minor
+b+    /dev/block-device-to-[re]create          mode user group -           major:minor
 C     /target/to/create                        -    -    -     -           /source/to/copy
 x     /path-or-glob/to/ignore                  -    -    -     -           -
 X     /path-or-glob/to/ignore/recursively      -    -    -     -           -
 r     /empty/dir/to/remove                     -    -    -     -           -
 R     /dir/to/remove/recursively               -    -    -     -           -
-z     /path-or-glob/to/adjust/mode             mode user group -           MAC context
-Z     /path-or-glob/to/adjust/mode/recursively mode user group -           MAC context
+z     /path-or-glob/to/adjust/mode             mode user group -           -
+Z     /path-or-glob/to/adjust/mode/recursively mode user group -           -
 t     /path-or-glob/to/set/xattrs              -    -    -     -           xattrs
 T     /path-or-glob/to/set/xattrs/recursively  -    -    -     -           xattrs
 h     /path-or-glob/to/set/attrs               -    -    -     -           file attrs
 H     /path-or-glob/to/set/attrs/recursively   -    -    -     -           file attrs
 a     /path-or-glob/to/set/acls                -    -    -     -           POSIX ACLs
+a+    /path-or-glob/to/append/acls             -    -    -     -           POSIX ACLs
 A     /path-or-glob/to/set/acls/recursively    -    -    -     -           POSIX ACLs
-# a+, A+ append ACLs
+A+    /path-or-glob/to/append/acls/recursively -    -    -     -           POSIX ACLs
+
 </programlisting>
   </refsynopsisdiv>
 
@@ -88,7 +94,7 @@ A     /path-or-glob/to/set/acls/recursively    -    -    -     -           POSIX
     <filename>systemd-tmpfiles-cleanup.service</filename>, and associated units.</para>
 
     <para>System daemons frequently require private runtime directories below <filename>/run</filename> to
-    store communication sockets and similar. For these, is is better to use
+    store communication sockets and similar. For these, it is better to use
     <varname>RuntimeDirectory=</varname> in their unit files (see
     <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
     details), if the flexibility provided by <filename>tmpfiles.d</filename> is not required. The advantages
@@ -114,16 +120,19 @@ A     /path-or-glob/to/set/acls/recursively    -    -    -     -           POSIX
     <filename>/usr/lib/tmpfiles.d</filename> and <filename>/run/tmpfiles.d</filename>. Files in
     <filename>/run/tmpfiles.d</filename> override files with the same name in
     <filename>/usr/lib/tmpfiles.d</filename>. Packages should install their configuration files in
-    <filename>/usr/lib/tmpfiles.d</filename>. Files in <filename>/etc/tmpfiles.d</filename> are reserved for the local
-    administrator, who may use this logic to override the configuration files installed by vendor packages. All
-    configuration files are sorted by their filename in lexicographic order, regardless of which of the directories
-    they reside in. If multiple files specify the same path, the entry in the file with the lexicographically earliest
-    name will be applied.  All other conflicting entries will be logged as errors. When two lines are prefix path and
-    suffix path of each other, then the prefix line is always created first, the suffix later (and if removal applies
-    to the line, the order is reversed: the suffix is removed first, the prefix later). Lines that take globs are
-    applied after those accepting no globs. If multiple operations shall be applied on the same file (such as ACL,
-    xattr, file attribute adjustments), these are always done in the same fixed order. Except for those cases, the
-    files/directories are processed in the order they are listed.</para>
+    <filename>/usr/lib/tmpfiles.d</filename>. Files in <filename>/etc/tmpfiles.d</filename> are reserved for
+    the local administrator, who may use this logic to override the configuration files installed by vendor
+    packages. All configuration files are sorted by their filename in lexicographic order, regardless of
+    which of the directories they reside in. If multiple files specify the same path, the entry in the file
+    with the lexicographically earliest name will be applied (note that lines suppressed due to the
+    <literal>!</literal> are filtered before application, meaning that if an early line carries the
+    exclamation mark and is suppressed because of that, a later line matching in path will be applied).  All
+    other conflicting entries will be logged as errors. When two lines are prefix path and suffix path of
+    each other, then the prefix line is always created first, the suffix later (and if removal applies to the
+    line, the order is reversed: the suffix is removed first, the prefix later). Lines that take globs are
+    applied after those accepting no globs. If multiple operations shall be applied on the same file (such as
+    ACL, xattr, file attribute adjustments), these are always done in the same fixed order. Except for those
+    cases, the files/directories are processed in the order they are listed.</para>
 
     <para>If the administrator wants to disable a configuration file
     supplied by the vendor, the recommended way is to place a symlink
@@ -147,33 +156,30 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
     <refsect2>
       <title>Type</title>
 
-      <para>The type consists of a single letter and optionally an
-      exclamation mark and/or minus sign.</para>
+      <para>The type consists of a single letter and optionally an exclamation mark (<literal>!</literal>)
+      and/or minus sign (<literal>-</literal>).</para>
 
       <para>The following line types are understood:</para>
 
       <variablelist>
         <varlistentry>
           <term><varname>f</varname></term>
-          <listitem><para>Create a file if it does not exist yet. If the argument parameter is given and the file did
-          not exist yet, it will be written to the file. Does not follow symlinks.</para></listitem>
-        </varlistentry>
-
-        <varlistentry>
-          <term><varname>F</varname></term>
-          <listitem><para>Create or truncate a file. If the argument
-          parameter is given, it will be written to the file. Does not follow symlinks.</para>
-          </listitem>
+          <term><varname>f+</varname></term>
+          <listitem><para><varname>f</varname> will create a file if it does not exist yet. If the argument
+          parameter is given and the file did not exist yet, it will be written to the file.
+          <varname>f+</varname> will create or truncate the file. If the argument parameter is given, it will
+          be written to the file. Does not follow symlinks.</para></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><varname>w</varname></term>
-          <listitem><para>Write the argument parameter to a file, if
-          the file exists.  Lines of this type accept shell-style
-          globs in place of normal path names. The argument parameter
-          will be written without a trailing newline. C-style
-          backslash escapes are interpreted. Follows
-          symlinks.</para></listitem>
+          <term><varname>w+</varname></term>
+          <listitem><para>Write the argument parameter to a file, if the file exists.
+          If suffixed with <varname>+</varname>, the line will be appended to the file.
+          If your configuration writes multiple lines to the same file, use <varname>w+</varname>.
+          Lines of this type accept shell-style globs in place of normal path names.
+          The argument parameter will be written without a trailing newline.
+          C-style backslash escapes are interpreted. Follows symlinks.</para></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -449,13 +455,10 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
         </varlistentry>
       </variablelist>
 
-      <para>If the exclamation mark is used, this line is only safe to
-      execute during boot, and can break a running system. Lines
-      without the exclamation mark are presumed to be safe to execute
-      at any time, e.g. on package upgrades.
-      <command>systemd-tmpfiles</command> will execute line with an
-      exclamation mark only if option <option>--boot</option> is
-      given.</para>
+      <para>If the exclamation mark (<literal>!</literal>) is used, this line is only safe to execute during
+      boot, and can break a running system. Lines without the exclamation mark are presumed to be safe to
+      execute at any time, e.g. on package upgrades. <command>systemd-tmpfiles</command> will take lines with
+      an exclamation mark only into consideration, if the <option>--boot</option> option is given.</para>
 
       <para>For example:
       <programlisting># Make sure these are created by default so that nobody else can
@@ -467,9 +470,8 @@ r! /tmp/.X[0-9]*-lock</programlisting>
       running system, and will only be executed with
       <option>--boot</option>.</para>
 
-      <para>If the minus sign is used, this line failing to run
-      successfully during create (and only create) will not cause
-      the execution of <command>systemd-tmpfiles</command> to return
+      <para>If the minus sign (<literal>-</literal>) is used, this line failing to run successfully during
+      create (and only create) will not cause the execution of <command>systemd-tmpfiles</command> to return
       an error.</para>
 
       <para>For example:
@@ -532,7 +534,7 @@ w- /proc/sys/vm/swappiness - - - - 10</programlisting></para>
       guaranteed to be resolvable during early boot. If this field references users/groups that only become
       resolveable during later boot (i.e. after NIS, LDAP or a similar networked directory service become
       available), execution of the operations declared by the line will likely fail. Also see <ulink
-      url="https://systemd.io/UIDS-GIDS.html#notes-on-resolvability-of-user-and-group-names">Notes on
+      url="https://systemd.io/UIDS-GIDS/#notes-on-resolvability-of-user-and-group-names">Notes on
       Resolvability of User and Group Names</ulink> for more information on requirements on system user/group
       definitions.</para>
     </refsect2>
@@ -651,7 +653,7 @@ w- /proc/sys/vm/swappiness - - - - 10</programlisting></para>
             <row>
               <entry><literal>%L</literal></entry>
               <entry>System or user log directory</entry>
-              <entry>In <option>--user</option> mode, this is the same as <varname>$XDG_CONFIG_HOME</varname> with <filename noindex='true'>/log</filename> appended, and <filename>/var/log</filename> otherwise.</entry>
+              <entry>In <option>--user</option> mode, this is the same as <varname>$XDG_CONFIG_HOME</varname> with <filename index="false">/log</filename> appended, and <filename>/var/log</filename> otherwise.</entry>
             </row>
             <row>
               <entry><literal>%m</literal></entry>

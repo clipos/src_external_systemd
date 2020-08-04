@@ -36,8 +36,6 @@ struct NLTypeSystemUnion {
         const NLTypeSystem *type_systems;
 };
 
-extern const NLTypeSystem rtnl_type_system_root;
-extern const NLTypeSystem genl_type_system_root;
 extern const NLTypeSystem genl_family_type_system_root;
 
 uint16_t type_get_type(const NLType *type);
@@ -47,6 +45,7 @@ void type_get_type_system_union(const NLType *type, const NLTypeSystemUnion **re
 
 const NLTypeSystem* type_system_get_root(int protocol);
 uint16_t type_system_get_count(const NLTypeSystem *type_system);
+int type_system_root_get_type(sd_netlink *nl, const NLType **ret, uint16_t type);
 int type_system_get_type(const NLTypeSystem *type_system, const NLType **ret, uint16_t type);
 int type_system_get_type_system(const NLTypeSystem *type_system, const NLTypeSystem **ret, uint16_t type);
 int type_system_get_type_system_union(const NLTypeSystem *type_system, const NLTypeSystemUnion **ret, uint16_t type);
@@ -84,9 +83,22 @@ typedef enum NLUnionLinkInfoData {
         NL_UNION_LINK_INFO_DATA_MACSEC,
         NL_UNION_LINK_INFO_DATA_NLMON,
         NL_UNION_LINK_INFO_DATA_XFRM,
+        NL_UNION_LINK_INFO_DATA_IFB,
         _NL_UNION_LINK_INFO_DATA_MAX,
         _NL_UNION_LINK_INFO_DATA_INVALID = -1
 } NLUnionLinkInfoData;
 
 const char *nl_union_link_info_data_to_string(NLUnionLinkInfoData p) _const_;
 NLUnionLinkInfoData nl_union_link_info_data_from_string(const char *p) _pure_;
+
+typedef enum NLUnionTCAOptionData {
+        NL_UNION_TCA_OPTION_DATA_CODEL,
+        NL_UNION_TCA_OPTION_DATA_FQ,
+        NL_UNION_TCA_OPTION_DATA_FQ_CODEL,
+        NL_UNION_TCA_OPTION_DATA_TBF,
+        _NL_UNION_TCA_OPTION_DATA_MAX,
+        _NL_UNION_TCA_OPTION_DATA_INVALID = -1,
+} NLUnionTCAOptionData;
+
+const char *nl_union_tca_option_data_to_string(NLUnionTCAOptionData p) _const_;
+NLUnionTCAOptionData nl_union_tca_option_data_from_string(const char *p) _pure_;

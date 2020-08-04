@@ -103,7 +103,7 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                         _fallthrough_;
                 case ENTRY_BOOT_ID: {
                         sd_id128_t boot_id;
-                        char sid[33];
+                        char sid[SD_ID128_STRING_MAX];
 
                         r = sd_journal_get_monotonic_usec(u->journal, NULL, &boot_id);
                         if (r < 0)
@@ -410,5 +410,5 @@ int open_journal_for_upload(Uploader *u,
                                                cursor);
         }
 
-        return process_journal_input(u, 1 + !!after_cursor);
+        return process_journal_input(u, !!after_cursor);
 }

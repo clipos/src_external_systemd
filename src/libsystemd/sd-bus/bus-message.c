@@ -45,12 +45,24 @@ static void message_free_part(sd_bus_message *m, struct bus_body_part *part) {
         assert(m);
         assert(part);
 
-        if (part->memfd >= 0)
+        if (part->memfd >= 0) {
+                /* erase if requested, but ony if the memfd is not sealed yet, i.e. is writable */
+                if (m->sensitive && !m->sealed)
+                        explicit_bzero_safe(part->data, part->size);
+
                 close_and_munmap(part->memfd, part->mmap_begin, part->mapped);
-        else if (part->munmap_this)
+        } else if (part->munmap_this)
+                /* We don't erase sensitive data here, since the data is memory mapped from someone else, and
+                 * we just don't know if it's OK to write to it */
                 munmap(part->mmap_begin, part->mapped);
-        else if (part->free_this)
-                free(part->data);
+        else {
+                /* Erase this if that is requested. Since this is regular memory we know we can write it. */
+                if (m->sensitive)
+                        explicit_bzero_safe(part->data, part->size);
+
+                if (part->free_this)
+                        free(part->data);
+        }
 
         if (part != &m->body)
                 free(part);
@@ -113,10 +125,10 @@ static void message_reset_containers(sd_bus_message *m) {
 static sd_bus_message* message_free(sd_bus_message *m) {
         assert(m);
 
+        message_reset_parts(m);
+
         if (m->free_header)
                 free(m->header);
-
-        message_reset_parts(m);
 
         /* Note that we don't unref m->bus here. That's already done by sd_bus_message_unref() as each user
          * reference to the bus message also is considered a reference to the bus connection itself. */
@@ -439,7 +451,7 @@ int bus_message_from_header(
         if (!IN_SET(h->version, 1, 2))
                 return -EBADMSG;
 
-        if (h->type == _SD_BUS_MESSAGE_TYPE_INVALID)
+        if (h->type <= _SD_BUS_MESSAGE_TYPE_INVALID || h->type >= _SD_BUS_MESSAGE_TYPE_MAX)
                 return -EBADMSG;
 
         if (!IN_SET(h->endian, BUS_LITTLE_ENDIAN, BUS_BIG_ENDIAN))
@@ -578,7 +590,7 @@ _public_ int sd_bus_message_new(
         assert_return(bus, -ENOTCONN);
         assert_return(bus->state != BUS_UNSET, -ENOTCONN);
         assert_return(m, -EINVAL);
-        assert_return(type < _SD_BUS_MESSAGE_TYPE_MAX, -EINVAL);
+        assert_return(type > _SD_BUS_MESSAGE_TYPE_INVALID && type < _SD_BUS_MESSAGE_TYPE_MAX, -EINVAL);
 
         t = malloc0(ALIGN(sizeof(sd_bus_message)) + sizeof(struct bus_header));
         if (!t)
@@ -726,6 +738,12 @@ static int message_new_reply(
 
         t->dont_send = !!(call->header->flags & BUS_MESSAGE_NO_REPLY_EXPECTED);
         t->enforced_reply_signature = call->enforced_reply_signature;
+
+        /* let's copy the sensitive flag over. Let's do that as a safety precaution to keep a transaction
+         * wholly sensitive if already the incoming message was sensitive. This is particularly useful when a
+         * vtable record sets the SD_BUS_VTABLE_SENSITIVE flag on a method call, since this means it applies
+         * to both the message call and the reply. */
+        t->sensitive = call->sensitive;
 
         *m = TAKE_PTR(t);
         return 0;
@@ -1279,19 +1297,18 @@ static int message_add_offset(sd_bus_message *m, size_t offset) {
 }
 
 static void message_extend_containers(sd_bus_message *m, size_t expand) {
-        struct bus_container *c;
-
         assert(m);
 
         if (expand <= 0)
                 return;
 
-        /* Update counters */
-        for (c = m->containers; c < m->containers + m->n_containers; c++) {
+        if (m->n_containers <= 0)
+                return;
 
+        /* Update counters */
+        for (struct bus_container *c = m->containers; c < m->containers + m->n_containers; c++)
                 if (c->array_size)
                         *c->array_size += expand;
-        }
 }
 
 static void *message_extend_body(
@@ -1354,7 +1371,6 @@ static void *message_extend_body(
                         if (r < 0)
                                 return NULL;
                 } else {
-                        struct bus_container *c;
                         void *op;
                         size_t os, start_part, end_part;
 
@@ -1375,8 +1391,9 @@ static void *message_extend_body(
                         }
 
                         /* Readjust pointers */
-                        for (c = m->containers; c < m->containers + m->n_containers; c++)
-                                c->array_size = adjust_pointer(c->array_size, op, os, part->data);
+                        if (m->n_containers > 0)
+                                for (struct bus_container *c = m->containers; c < m->containers + m->n_containers; c++)
+                                        c->array_size = adjust_pointer(c->array_size, op, os, part->data);
 
                         m->error.message = (const char*) adjust_pointer(m->error.message, op, os, part->data);
                 }
@@ -3140,7 +3157,8 @@ static struct bus_body_part* find_part(sd_bus_message *m, size_t index, size_t s
                                 return NULL;
 
                         if (p)
-                                *p = (uint8_t*) part->data + index - begin;
+                                *p = part->data ? (uint8_t*) part->data + index - begin
+                                        : NULL; /* Avoid dereferencing a NULL pointer. */
 
                         m->cached_rindex_part = part;
                         m->cached_rindex_part_begin = begin;
@@ -5184,29 +5202,34 @@ int bus_message_parse_fields(sd_bus_message *m) {
                  * table */
                 m->user_body_size = m->body_size - ((char*) m->footer + m->footer_accessible - p);
 
-                /* Pull out the offset table for the fields array */
-                sz = bus_gvariant_determine_word_size(m->fields_size, 0);
-                if (sz > 0) {
-                        size_t framing;
-                        void *q;
+                /* Pull out the offset table for the fields array, if any */
+                if (m->fields_size > 0) {
+                        sz = bus_gvariant_determine_word_size(m->fields_size, 0);
+                        if (sz > 0) {
+                                size_t framing;
+                                void *q;
 
-                        ri = m->fields_size - sz;
-                        r = message_peek_fields(m, &ri, 1, sz, &q);
-                        if (r < 0)
-                                return r;
+                                if (m->fields_size < sz)
+                                        return -EBADMSG;
 
-                        framing = bus_gvariant_read_word_le(q, sz);
-                        if (framing >= m->fields_size - sz)
-                                return -EBADMSG;
-                        if ((m->fields_size - framing) % sz != 0)
-                                return -EBADMSG;
+                                ri = m->fields_size - sz;
+                                r = message_peek_fields(m, &ri, 1, sz, &q);
+                                if (r < 0)
+                                        return r;
 
-                        ri = framing;
-                        r = message_peek_fields(m, &ri, 1, m->fields_size - framing, &offsets);
-                        if (r < 0)
-                                return r;
+                                framing = bus_gvariant_read_word_le(q, sz);
+                                if (framing >= m->fields_size - sz)
+                                        return -EBADMSG;
+                                if ((m->fields_size - framing) % sz != 0)
+                                        return -EBADMSG;
 
-                        n_offsets = (m->fields_size - framing) / sz;
+                                ri = framing;
+                                r = message_peek_fields(m, &ri, 1, m->fields_size - framing, &offsets);
+                                if (r < 0)
+                                        return r;
+
+                                n_offsets = (m->fields_size - framing) / sz;
+                        }
                 }
         } else
                 m->user_body_size = m->body_size;
@@ -5474,6 +5497,9 @@ int bus_message_parse_fields(sd_bus_message *m) {
                 if (m->reply_cookie == 0 || !m->error.name)
                         return -EBADMSG;
                 break;
+
+        default:
+                assert_not_reached("Bad message type");
         }
 
         /* Refuse non-local messages that claim they are local */
@@ -5917,5 +5943,12 @@ _public_ int sd_bus_message_set_priority(sd_bus_message *m, int64_t priority) {
         assert_return(!m->sealed, -EPERM);
 
         m->priority = priority;
+        return 0;
+}
+
+_public_ int sd_bus_message_sensitive(sd_bus_message *m) {
+        assert_return(m, -EINVAL);
+
+        m->sensitive = true;
         return 0;
 }

@@ -41,6 +41,11 @@ uint64_t physical_memory(void) {
         }
         if (r > 0) {
                 r = cg_get_attribute("memory", root, "memory.max", &value);
+                if (r == -ENOENT) /* Field does not exist on the system's top-level cgroup, hence don't
+                                   * complain. (Note that it might exist on our own root though, if we live
+                                   * in a cgroup namespace, hence check anyway instead of not even
+                                   * trying.) */
+                        return mem;
                 if (r < 0) {
                         log_debug_errno(r, "Failed to read memory.max cgroup attribute, ignoring cgroup memory limit: %m");
                         return mem;
@@ -99,7 +104,6 @@ uint64_t physical_memory_scale(uint64_t v, uint64_t max) {
 }
 
 uint64_t system_tasks_max(void) {
-
         uint64_t a = TASKS_MAX, b = TASKS_MAX;
         _cleanup_free_ char *root = NULL;
         int r;

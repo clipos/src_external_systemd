@@ -1,16 +1,20 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <net/if.h>
+#include <netinet/in.h>
+#include <sys/capability.h>
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
-#include "bus-util.h"
+#include "bus-polkit.h"
 #include "networkd-link-bus.h"
 #include "networkd-link.h"
 #include "networkd-manager-bus.h"
 #include "networkd-manager.h"
 #include "path-util.h"
+#include "socket-netlink.h"
 #include "strv.h"
+#include "user-util.h"
 
 static int method_list_links(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
@@ -62,9 +66,9 @@ static int method_get_link_by_name(sd_bus_message *message, void *userdata, sd_b
         if (r < 0)
                 return r;
 
-        index = if_nametoindex(name);
-        if (index <= 0)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_LINK, "Link %s not known", name);
+        index = resolve_ifname(&manager->rtnl, name);
+        if (index < 0)
+                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_LINK, "Link %s cannot be resolved", name);
 
         link = hashmap_get(manager->links, INT_TO_PTR(index));
         if (!link)
@@ -183,6 +187,46 @@ static int bus_method_revert_link_dns(sd_bus_message *message, void *userdata, s
         return call_link_method(userdata, message, bus_link_method_revert_dns, error);
 }
 
+static int bus_method_renew_link(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        return call_link_method(userdata, message, bus_link_method_renew, error);
+}
+
+static int bus_method_reconfigure_link(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        return call_link_method(userdata, message, bus_link_method_reconfigure, error);
+}
+
+static int bus_method_reload(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Manager *manager = userdata;
+        Iterator i;
+        Link *link;
+        int r;
+
+        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
+                                    "org.freedesktop.network1.reload",
+                                    NULL, true, UID_INVALID,
+                                    &manager->polkit_registry, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Polkit will call us back */
+
+        r = netdev_load(manager, true);
+        if (r < 0)
+                return r;
+
+        r = network_reload(manager);
+        if (r < 0)
+                return r;
+
+        HASHMAP_FOREACH(link, manager->links, i) {
+                r = link_reconfigure(link, false);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_bus_reply_method_return(message, NULL);
+}
+
 const sd_bus_vtable manager_vtable[] = {
         SD_BUS_VTABLE_START(0),
 
@@ -204,6 +248,9 @@ const sd_bus_vtable manager_vtable[] = {
         SD_BUS_METHOD("SetLinkDNSSECNegativeTrustAnchors", "ias", NULL, bus_method_set_link_dnssec_negative_trust_anchors, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("RevertLinkNTP", "i", NULL, bus_method_revert_link_ntp, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("RevertLinkDNS", "i", NULL, bus_method_revert_link_dns, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("RenewLink", "i", NULL, bus_method_renew_link, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("ReconfigureLink", "i", NULL, bus_method_reconfigure_link, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("Reload", NULL, NULL, bus_method_reload, SD_BUS_VTABLE_UNPRIVILEGED),
 
         SD_BUS_VTABLE_END
 };

@@ -21,6 +21,7 @@ typedef struct Manager Manager;
 #include "missing_resource.h"
 #include "namespace.h"
 #include "nsflags.h"
+#include "numa-util.h"
 #include "time-util.h"
 
 #define EXEC_STDIN_DATA_MAX (64U*1024U*1024U)
@@ -181,6 +182,7 @@ struct ExecContext {
 
         CPUSet cpu_set;
         NUMAPolicy numa_policy;
+        bool cpu_affinity_from_numa;
 
         ExecInput std_input;
         ExecOutput std_output;
@@ -245,10 +247,12 @@ struct ExecContext {
         struct iovec* log_extra_fields;
         size_t n_log_extra_fields;
 
-        usec_t log_rate_limit_interval_usec;
-        unsigned log_rate_limit_burst;
+        usec_t log_ratelimit_interval_usec;
+        unsigned log_ratelimit_burst;
 
         int log_level_max;
+
+        char *log_namespace;
 
         bool private_tmp;
         bool private_network;
@@ -257,6 +261,8 @@ struct ExecContext {
         bool private_mounts;
         bool protect_kernel_tunables;
         bool protect_kernel_modules;
+        bool protect_kernel_logs;
+        bool protect_clock;
         bool protect_control_groups;
         ProtectSystem protect_system;
         ProtectHome protect_home;
@@ -400,6 +406,8 @@ void exec_runtime_deserialize_one(Manager *m, const char *value, FDSet *fds);
 void exec_runtime_vacuum(Manager *m);
 
 void exec_params_clear(ExecParameters *p);
+
+bool exec_context_get_cpu_affinity_from_numa(const ExecContext *c);
 
 const char* exec_output_to_string(ExecOutput i) _const_;
 ExecOutput exec_output_from_string(const char *s) _pure_;

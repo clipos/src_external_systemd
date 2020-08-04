@@ -4,12 +4,9 @@
 #include <linux/l2tp.h>
 #include <linux/genetlink.h>
 
-#include "sd-netlink.h"
-
 #include "conf-parser.h"
 #include "hashmap.h"
 #include "l2tp-tunnel.h"
-#include "missing.h"
 #include "netlink-util.h"
 #include "networkd-address.h"
 #include "networkd-manager.h"
@@ -47,7 +44,7 @@ static void l2tp_session_free(L2tpSession *s) {
                 return;
 
         if (s->tunnel && s->section)
-                ordered_hashmap_remove(s->tunnel->sessions_by_section, s);
+                ordered_hashmap_remove(s->tunnel->sessions_by_section, s->section);
 
         network_config_section_free(s->section);
 
@@ -726,7 +723,7 @@ static void l2tp_tunnel_done(NetDev *netdev) {
 const NetDevVTable l2tptnl_vtable = {
         .object_size = sizeof(L2tpTunnel),
         .init = l2tp_tunnel_init,
-        .sections = "Match\0NetDev\0L2TP\0L2TPSession\0",
+        .sections = NETDEV_COMMON_SECTIONS "L2TP\0L2TPSession\0",
         .create_after_configured = l2tp_create_tunnel,
         .done = l2tp_tunnel_done,
         .create_type = NETDEV_CREATE_AFTER_CONFIGURED,

@@ -6,6 +6,7 @@
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
+#include "bus-polkit.h"
 #include "bus-util.h"
 #include "dns-domain.h"
 #include "networkd-link-bus.h"
@@ -41,14 +42,10 @@ static int property_get_bit_rates(
 
         manager = link->manager;
 
-        if (!manager->use_speed_meter)
-                return sd_bus_error_set(error, BUS_ERROR_SPEED_METER_INACTIVE, "Speed meter is disabled.");
-
-        if (manager->speed_meter_usec_old == 0)
-                return sd_bus_error_set(error, BUS_ERROR_SPEED_METER_INACTIVE, "Speed meter is not active.");
-
-        if (!link->stats_updated)
-                return sd_bus_error_set(error, BUS_ERROR_SPEED_METER_INACTIVE, "Failed to measure bit-rates.");
+        if (!manager->use_speed_meter ||
+            manager->speed_meter_usec_old == 0 ||
+            !link->stats_updated)
+                return sd_bus_message_append(reply, "(tt)", UINT64_MAX, UINT64_MAX);
 
         assert(manager->speed_meter_usec_new > manager->speed_meter_usec_old);
         interval_sec = (manager->speed_meter_usec_new - manager->speed_meter_usec_old) / USEC_PER_SEC;
@@ -575,6 +572,64 @@ int bus_link_method_revert_dns(sd_bus_message *message, void *userdata, sd_bus_e
         return sd_bus_reply_method_return(message, NULL);
 }
 
+int bus_link_method_renew(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Link *l = userdata;
+        int r;
+
+        assert(l);
+
+        if (!l->network)
+                return sd_bus_error_setf(error, BUS_ERROR_UNMANAGED_INTERFACE,
+                                         "Interface %s is not managed by systemd-networkd",
+                                         l->ifname);
+
+        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
+                                    "org.freedesktop.network1.renew",
+                                    NULL, true, UID_INVALID,
+                                    &l->manager->polkit_registry, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Polkit will call us back */
+
+        if (l->dhcp_client) {
+                r = sd_dhcp_client_send_renew(l->dhcp_client);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_bus_reply_method_return(message, NULL);
+}
+
+int bus_link_method_reconfigure(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Link *l = userdata;
+        int r;
+
+        assert(message);
+        assert(l);
+
+        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
+                                    "org.freedesktop.network1.reconfigure",
+                                    NULL, true, UID_INVALID,
+                                    &l->manager->polkit_registry, error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Polkit will call us back */
+
+        r = link_reconfigure(l, true);
+        if (r < 0)
+                return r;
+
+        link_set_state(l, LINK_STATE_INITIALIZED);
+        r = link_save(l);
+        if (r < 0)
+                return r;
+        link_clean(l);
+
+        return sd_bus_reply_method_return(message, NULL);
+}
+
 const sd_bus_vtable link_vtable[] = {
         SD_BUS_VTABLE_START(0),
 
@@ -595,6 +650,8 @@ const sd_bus_vtable link_vtable[] = {
         SD_BUS_METHOD("SetDNSSECNegativeTrustAnchors", "as", NULL, bus_link_method_set_dnssec_negative_trust_anchors, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("RevertNTP", NULL, NULL, bus_link_method_revert_ntp, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("RevertDNS", NULL, NULL, bus_link_method_revert_dns, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("Renew", NULL, NULL, bus_link_method_renew, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("Reconfigure", NULL, NULL, bus_link_method_reconfigure, SD_BUS_VTABLE_UNPRIVILEGED),
 
         SD_BUS_VTABLE_END
 };
@@ -665,8 +722,8 @@ int link_object_find(sd_bus *bus, const char *path, const char *interface, void 
         if (r <= 0)
                 return 0;
 
-        r = parse_ifindex(identifier, &ifindex);
-        if (r < 0)
+        ifindex = parse_ifindex(identifier);
+        if (ifindex < 0)
                 return 0;
 
         r = link_get(m, ifindex, &link);
