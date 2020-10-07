@@ -66,6 +66,8 @@ int btrfs_quota_scan_ongoing(int fd);
 int btrfs_subvol_make(const char *path);
 int btrfs_subvol_make_fd(int fd, const char *subvolume);
 
+int btrfs_subvol_make_fallback(const char *path, mode_t);
+
 int btrfs_subvol_snapshot_fd_full(int old_fd, const char *new_path, BtrfsSnapshotFlags flags, copy_progress_path_t progress_path, copy_progress_bytes_t progress_bytes, void *userdata);
 static inline int btrfs_subvol_snapshot_fd(int old_fd, const char *new_path, BtrfsSnapshotFlags flags) {
         return btrfs_subvol_snapshot_fd_full(old_fd, new_path, flags, NULL, NULL, NULL);
@@ -119,3 +121,9 @@ int btrfs_qgroup_find_parents(int fd, uint64_t qgroupid, uint64_t **ret);
 
 int btrfs_qgroup_get_quota_fd(int fd, uint64_t qgroupid, BtrfsQuotaInfo *quota);
 int btrfs_qgroup_get_quota(const char *path, uint64_t qgroupid, BtrfsQuotaInfo *quota);
+
+static inline int btrfs_log_dev_root(int level, int ret, const char *p) {
+        return log_full_errno(level, ret,
+                              "File system behind %s is reported by btrfs to be backed by pseudo-device /dev/root, which is not a valid userspace accessible device node. "
+                              "Cannot determine correct backing block device.", p);
+}

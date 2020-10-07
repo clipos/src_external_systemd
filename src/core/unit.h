@@ -49,6 +49,10 @@ static inline bool UNIT_IS_INACTIVE_OR_FAILED(UnitActiveState t) {
         return IN_SET(t, UNIT_INACTIVE, UNIT_FAILED);
 }
 
+static inline bool UNIT_IS_LOAD_COMPLETE(UnitLoadState t) {
+        return t >= 0 && t < _UNIT_LOAD_STATE_MAX && t != UNIT_STUB && t != UNIT_MERGED;
+}
+
 /* Stores the 'reason' a dependency was created as a bit mask, i.e. due to which configuration source it came to be. We
  * use this so that we can selectively flush out parts of dependencies again. Note that the same dependency might be
  * created as a result of multiple "reasons", hence the bitmask. */
@@ -114,10 +118,13 @@ typedef struct Unit {
         UnitLoadState load_state;
         Unit *merged_into;
 
-        char *id; /* One name is special because we use it for identification. Points to an entry in the names set */
+        FreezerState freezer_state;
+        sd_bus_message *pending_freezer_message;
+
+        char *id;   /* The one special name that we use for identification */
         char *instance;
 
-        Set *names;
+        Set *aliases; /* All the other names. */
 
         /* For each dependency type we maintain a Hashmap whose key is the Unit* object, and the value encodes why the
          * dependency exists, using the UnitDependencyInfo type */
@@ -133,6 +140,7 @@ typedef struct Unit {
         char *source_path; /* if converted, the source file */
         char **dropin_paths;
 
+        usec_t fragment_not_found_timestamp_hash;
         usec_t fragment_mtime;
         usec_t source_mtime;
         usec_t dropin_mtime;
@@ -483,6 +491,11 @@ typedef struct UnitVTable {
         /* Clear out the various runtime/state/cache/logs/configuration data */
         int (*clean)(Unit *u, ExecCleanMask m);
 
+        /* Freeze the unit */
+        int (*freeze)(Unit *u);
+        int (*thaw)(Unit *u);
+        bool (*can_freeze)(Unit *u);
+
         /* Return which kind of data can be cleaned */
         int (*can_clean)(Unit *u, ExecCleanMask *ret);
 
@@ -531,7 +544,7 @@ typedef struct UnitVTable {
         void (*notify_cgroup_oom)(Unit *u);
 
         /* Called whenever a process of this unit sends us a message */
-        void (*notify_message)(Unit *u, const struct ucred *ucred, char **tags, FDSet *fds);
+        void (*notify_message)(Unit *u, const struct ucred *ucred, char * const *tags, FDSet *fds);
 
         /* Called whenever a name this Unit registered for comes or goes away. */
         void (*bus_name_owner_change)(Unit *u, const char *new_owner);
@@ -591,9 +604,6 @@ typedef struct UnitVTable {
         /* If this function is set and return false all jobs for units
          * of this type will immediately fail. */
         bool (*supported)(void);
-
-        /* The bus vtable */
-        const sd_bus_vtable *bus_vtable;
 
         /* The strings to print in status messages */
         UnitStatusMessageFormats status_message_formats;
@@ -692,6 +702,8 @@ const char *unit_status_string(Unit *u) _pure_;
 bool unit_has_name(const Unit *u, const char *name);
 
 UnitActiveState unit_active_state(Unit *u);
+FreezerState unit_freezer_state(Unit *u);
+int unit_freezer_state_kernel(Unit *u, FreezerState *ret);
 
 const char* unit_sub_state_to_string(Unit *u);
 
@@ -822,7 +834,6 @@ void unit_unref_uid_gid(Unit *u, bool destroy_now);
 
 void unit_notify_user_lookup(Unit *u, uid_t uid, gid_t gid);
 
-int unit_set_invocation_id(Unit *u, sd_id128_t id);
 int unit_acquire_invocation_id(Unit *u);
 
 bool unit_shall_confirm_spawn(Unit *u);
@@ -839,7 +850,9 @@ void unit_unlink_state_files(Unit *u);
 
 int unit_prepare_exec(Unit *u);
 
-int unit_warn_leftover_processes(Unit *u);
+int unit_log_leftover_process_start(pid_t pid, int sig, void *userdata);
+int unit_log_leftover_process_stop(pid_t pid, int sig, void *userdata);
+int unit_warn_leftover_processes(Unit *u, cg_kill_log_func_t log_func);
 
 bool unit_needs_console(Unit *u);
 
@@ -875,9 +888,19 @@ void unit_destroy_runtime_directory(Unit *u, const ExecContext *context);
 int unit_clean(Unit *u, ExecCleanMask mask);
 int unit_can_clean(Unit *u, ExecCleanMask *ret_mask);
 
+bool unit_can_freeze(Unit *u);
+int unit_freeze(Unit *u);
+void unit_frozen(Unit *u);
+
+int unit_thaw(Unit *u);
+void unit_thawed(Unit *u);
+
+int unit_freeze_vtable_common(Unit *u);
+int unit_thaw_vtable_common(Unit *u);
+
 /* Macros which append UNIT= or USER_UNIT= to the message */
 
-#define log_unit_full(unit, level, error, ...)                          \
+#define log_unit_full_errno(unit, level, error, ...)                    \
         ({                                                              \
                 const Unit *_u = (unit);                                \
                 (log_get_max_level() < LOG_PRI(level)) ? -ERRNO_VALUE(error) : \
@@ -885,17 +908,19 @@ int unit_can_clean(Unit *u, ExecCleanMask *ret_mask);
                                 log_internal(level, error, PROJECT_FILE, __LINE__, __func__, ##__VA_ARGS__); \
         })
 
-#define log_unit_debug(unit, ...)   log_unit_full(unit, LOG_DEBUG, 0, ##__VA_ARGS__)
-#define log_unit_info(unit, ...)    log_unit_full(unit, LOG_INFO, 0, ##__VA_ARGS__)
-#define log_unit_notice(unit, ...)  log_unit_full(unit, LOG_NOTICE, 0, ##__VA_ARGS__)
-#define log_unit_warning(unit, ...) log_unit_full(unit, LOG_WARNING, 0, ##__VA_ARGS__)
-#define log_unit_error(unit, ...)   log_unit_full(unit, LOG_ERR, 0, ##__VA_ARGS__)
+#define log_unit_full(unit, level, ...) (void) log_unit_full_errno(unit, level, 0, __VA_ARGS__)
 
-#define log_unit_debug_errno(unit, error, ...)   log_unit_full(unit, LOG_DEBUG, error, ##__VA_ARGS__)
-#define log_unit_info_errno(unit, error, ...)    log_unit_full(unit, LOG_INFO, error, ##__VA_ARGS__)
-#define log_unit_notice_errno(unit, error, ...)  log_unit_full(unit, LOG_NOTICE, error, ##__VA_ARGS__)
-#define log_unit_warning_errno(unit, error, ...) log_unit_full(unit, LOG_WARNING, error, ##__VA_ARGS__)
-#define log_unit_error_errno(unit, error, ...)   log_unit_full(unit, LOG_ERR, error, ##__VA_ARGS__)
+#define log_unit_debug(unit, ...)   log_unit_full_errno(unit, LOG_DEBUG, 0, __VA_ARGS__)
+#define log_unit_info(unit, ...)    log_unit_full(unit, LOG_INFO, __VA_ARGS__)
+#define log_unit_notice(unit, ...)  log_unit_full(unit, LOG_NOTICE, __VA_ARGS__)
+#define log_unit_warning(unit, ...) log_unit_full(unit, LOG_WARNING, __VA_ARGS__)
+#define log_unit_error(unit, ...)   log_unit_full(unit, LOG_ERR, __VA_ARGS__)
+
+#define log_unit_debug_errno(unit, error, ...)   log_unit_full_errno(unit, LOG_DEBUG, error, __VA_ARGS__)
+#define log_unit_info_errno(unit, error, ...)    log_unit_full_errno(unit, LOG_INFO, error, __VA_ARGS__)
+#define log_unit_notice_errno(unit, error, ...)  log_unit_full_errno(unit, LOG_NOTICE, error, __VA_ARGS__)
+#define log_unit_warning_errno(unit, error, ...) log_unit_full_errno(unit, LOG_WARNING, error, __VA_ARGS__)
+#define log_unit_error_errno(unit, error, ...)   log_unit_full_errno(unit, LOG_ERR, error, __VA_ARGS__)
 
 #define LOG_UNIT_MESSAGE(unit, fmt, ...) "MESSAGE=%s: " fmt, (unit)->id, ##__VA_ARGS__
 #define LOG_UNIT_ID(unit) (unit)->manager->unit_log_format_string, (unit)->id

@@ -290,7 +290,7 @@ int get_user_creds(
                     (empty_or_root(p->pw_dir) ||
                      !path_is_valid(p->pw_dir) ||
                      !path_is_absolute(p->pw_dir)))
-                    *home = NULL; /* Note: we don't insist on normalized paths, since there are setups that have /./ in the path */
+                        *home = NULL; /* Note: we don't insist on normalized paths, since there are setups that have /./ in the path */
                 else
                         *home = p->pw_dir;
         }
@@ -777,7 +777,7 @@ bool valid_user_group_name(const char *u, ValidUserFlags flags) {
                         return false;
 
                 if (in_charset(u, "0123456789")) /* Don't allow fully numeric strings, they might be confused
-                                                  * with with UIDs (note that this test is more broad than
+                                                  * with UIDs (note that this test is more broad than
                                                   * the parse_uid() test above, as it will cover more than
                                                   * the 32bit range, and it will detect 65535 (which is in
                                                   * invalid UID, even though in the unsigned 32 bit range) */
@@ -861,6 +861,37 @@ bool valid_gecos(const char *d) {
                 return false;
 
         return true;
+}
+
+char *mangle_gecos(const char *d) {
+        char *mangled;
+
+        /* Makes sure the provided string becomes valid as a GEGOS field, by dropping bad chars. glibc's
+         * putwent() only changes \n and : to spaces. We do more: replace all CC too, and remove invalid
+         * UTF-8 */
+
+        mangled = strdup(d);
+        if (!mangled)
+                return NULL;
+
+        for (char *i = mangled; *i; i++) {
+                int len;
+
+                if ((uint8_t) *i < (uint8_t) ' ' || *i == ':') {
+                        *i = ' ';
+                        continue;
+                }
+
+                len = utf8_encoded_valid_unichar(i, (size_t) -1);
+                if (len < 0) {
+                        *i = ' ';
+                        continue;
+                }
+
+                i += len - 1;
+        }
+
+        return mangled;
 }
 
 bool valid_home(const char *p) {

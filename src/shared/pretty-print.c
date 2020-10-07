@@ -18,7 +18,7 @@
 #include "terminal-util.h"
 #include "util.h"
 
-static bool urlify_enabled(void) {
+bool urlify_enabled(void) {
         static int cached_urlify_enabled = -1;
 
         /* Unfortunately 'less' doesn't support links like this yet 😭, hence let's disable this as long as there's a
@@ -233,6 +233,12 @@ static int guess_type(const char **name, char ***prefixes, bool *is_collection, 
         n = strdup(*name);
         if (!n)
                 return log_oom();
+
+        /* All systemd-style config files should support the /usr-/etc-/run split and
+         * dropins. Let's add a blanket rule that allows us to support them without keeping
+         * an explicit list. */
+        if (path_startswith(n, "systemd") && endswith(n, ".conf"))
+                usr = true;
 
         delete_trailing_chars(n, "/");
 

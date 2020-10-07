@@ -54,6 +54,7 @@
 #include "format-util.h"
 #include "fs-util.h"
 #include "glob-util.h"
+#include "hexdecoct.h"
 #include "io-util.h"
 #include "ioprio.h"
 #include "label.h"
@@ -219,15 +220,8 @@ static bool is_terminal_input(ExecInput i) {
 static bool is_terminal_output(ExecOutput o) {
         return IN_SET(o,
                       EXEC_OUTPUT_TTY,
-                      EXEC_OUTPUT_SYSLOG_AND_CONSOLE,
                       EXEC_OUTPUT_KMSG_AND_CONSOLE,
                       EXEC_OUTPUT_JOURNAL_AND_CONSOLE);
-}
-
-static bool is_syslog_output(ExecOutput o) {
-        return IN_SET(o,
-                      EXEC_OUTPUT_SYSLOG,
-                      EXEC_OUTPUT_SYSLOG_AND_CONSOLE);
 }
 
 static bool is_kmsg_output(ExecOutput o) {
@@ -361,7 +355,7 @@ static int connect_logger_as(
                 params->flags & EXEC_PASS_LOG_UNIT ? unit->id : "",
                 context->syslog_priority,
                 !!context->syslog_level_prefix,
-                is_syslog_output(output),
+                false,
                 is_kmsg_output(output),
                 is_terminal_output(output)) < 0)
                 return -errno;
@@ -664,8 +658,6 @@ static int setup_output(
                 /* We don't reset the terminal if this is just about output */
                 return open_terminal_as(exec_context_tty_path(context), O_WRONLY, fileno);
 
-        case EXEC_OUTPUT_SYSLOG:
-        case EXEC_OUTPUT_SYSLOG_AND_CONSOLE:
         case EXEC_OUTPUT_KMSG:
         case EXEC_OUTPUT_KMSG_AND_CONSOLE:
         case EXEC_OUTPUT_JOURNAL:
@@ -1080,26 +1072,42 @@ static int enforce_groups(gid_t gid, const gid_t *supplementary_gids, int ngids)
         return 0;
 }
 
+static int set_securebits(int bits, int mask) {
+        int current, applied;
+        current = prctl(PR_GET_SECUREBITS);
+        if (current < 0)
+                return -errno;
+        /* Clear all securebits defined in mask and set bits */
+        applied = (current & ~mask) | bits;
+        if (current == applied)
+                return 0;
+        if (prctl(PR_SET_SECUREBITS, applied) < 0)
+                return -errno;
+        return 1;
+}
+
 static int enforce_user(const ExecContext *context, uid_t uid) {
         assert(context);
+        int r;
 
         if (!uid_is_valid(uid))
                 return 0;
 
         /* Sets (but doesn't look up) the uid and make sure we keep the
-         * capabilities while doing so. */
+         * capabilities while doing so. For setting secure bits the capability CAP_SETPCAP is
+         * required, so we also need keep-caps in this case.
+         */
 
-        if (context->capability_ambient_set != 0) {
+        if (context->capability_ambient_set != 0 || context->secure_bits != 0) {
 
                 /* First step: If we need to keep capabilities but
                  * drop privileges we need to make sure we keep our
                  * caps, while we drop privileges. */
                 if (uid != 0) {
-                        int sb = context->secure_bits | 1<<SECURE_KEEP_CAPS;
-
-                        if (prctl(PR_GET_SECUREBITS) != sb)
-                                if (prctl(PR_SET_SECUREBITS, sb) < 0)
-                                        return -errno;
+                        /* Add KEEP_CAPS to the securebits */
+                        r = set_securebits(1<<SECURE_KEEP_CAPS, 0);
+                        if (r < 0)
+                                return r;
                 }
         }
 
@@ -1388,14 +1396,14 @@ static void rename_process_from_path(const char *path) {
 static bool context_has_address_families(const ExecContext *c) {
         assert(c);
 
-        return c->address_families_whitelist ||
+        return c->address_families_allow_list ||
                 !set_isempty(c->address_families);
 }
 
 static bool context_has_syscall_filters(const ExecContext *c) {
         assert(c);
 
-        return c->syscall_whitelist ||
+        return c->syscall_allow_list ||
                 !hashmap_isempty(c->syscall_filter);
 }
 
@@ -1451,7 +1459,7 @@ static int apply_syscall_filter(const Unit* u, const ExecContext *c, bool needs_
 
         negative_action = c->syscall_errno == 0 ? scmp_act_kill_process() : SCMP_ACT_ERRNO(c->syscall_errno);
 
-        if (c->syscall_whitelist) {
+        if (c->syscall_allow_list) {
                 default_action = negative_action;
                 action = SCMP_ACT_ALLOW;
         } else {
@@ -1460,7 +1468,7 @@ static int apply_syscall_filter(const Unit* u, const ExecContext *c, bool needs_
         }
 
         if (needs_ambient_hack) {
-                r = seccomp_filter_set_add(c->syscall_filter, c->syscall_whitelist, syscall_filter_sets + SYSCALL_FILTER_SET_SETUID);
+                r = seccomp_filter_set_add(c->syscall_filter, c->syscall_allow_list, syscall_filter_sets + SYSCALL_FILTER_SET_SETUID);
                 if (r < 0)
                         return r;
         }
@@ -1491,7 +1499,7 @@ static int apply_address_families(const Unit* u, const ExecContext *c) {
         if (skip_seccomp_unavailable(u, "RestrictAddressFamilies="))
                 return 0;
 
-        return seccomp_restrict_address_families(c->address_families, c->address_families_whitelist);
+        return seccomp_restrict_address_families(c->address_families, c->address_families_allow_list);
 }
 
 static int apply_memory_deny_write_execute(const Unit* u, const ExecContext *c) {
@@ -2569,7 +2577,7 @@ static bool insist_on_sandboxing(
         assert(n_bind_mounts == 0 || bind_mounts);
 
         /* Checks whether we need to insist on fs namespacing. i.e. whether we have settings configured that
-         * would alter the view on the file system beyond making things read-only or invisble, i.e. would
+         * would alter the view on the file system beyond making things read-only or invisible, i.e. would
          * rearrange stuff in a way we cannot ignore gracefully. */
 
         if (context->n_temporary_filesystems > 0)
@@ -2602,7 +2610,7 @@ static int apply_mount_namespace(
                 char **error_path) {
 
         _cleanup_strv_free_ char **empty_directories = NULL;
-        char *tmp = NULL, *var = NULL;
+        const char *tmp_dir = NULL, *var_tmp_dir = NULL;
         const char *root_dir = NULL, *root_image = NULL;
         NamespaceInfo ns_info;
         bool needs_sandboxing;
@@ -2627,13 +2635,19 @@ static int apply_mount_namespace(
         if (needs_sandboxing) {
                 /* The runtime struct only contains the parent of the private /tmp,
                  * which is non-accessible to world users. Inside of it there's a /tmp
-                 * that is sticky, and that's the one we want to use here. */
+                 * that is sticky, and that's the one we want to use here.
+                 * This does not apply when we are using /run/systemd/empty as fallback. */
 
                 if (context->private_tmp && runtime) {
-                        if (runtime->tmp_dir)
-                                tmp = strjoina(runtime->tmp_dir, "/tmp");
-                        if (runtime->var_tmp_dir)
-                                var = strjoina(runtime->var_tmp_dir, "/tmp");
+                        if (streq_ptr(runtime->tmp_dir, RUN_SYSTEMD_EMPTY))
+                                tmp_dir = runtime->tmp_dir;
+                        else if (runtime->tmp_dir)
+                                tmp_dir = strjoina(runtime->tmp_dir, "/tmp");
+
+                        if (streq_ptr(runtime->var_tmp_dir, RUN_SYSTEMD_EMPTY))
+                                var_tmp_dir = runtime->var_tmp_dir;
+                        else if (runtime->var_tmp_dir)
+                                var_tmp_dir = strjoina(runtime->var_tmp_dir, "/tmp");
                 }
 
                 ns_info = (NamespaceInfo) {
@@ -2671,12 +2685,15 @@ static int apply_mount_namespace(
                             n_bind_mounts,
                             context->temporary_filesystems,
                             context->n_temporary_filesystems,
-                            tmp,
-                            var,
+                            tmp_dir,
+                            var_tmp_dir,
                             context->log_namespace,
                             needs_sandboxing ? context->protect_home : PROTECT_HOME_NO,
                             needs_sandboxing ? context->protect_system : PROTECT_SYSTEM_NO,
                             context->mount_flags,
+                            context->root_hash, context->root_hash_size, context->root_hash_path,
+                            context->root_hash_sig, context->root_hash_sig_size, context->root_hash_sig_path,
+                            context->root_verity,
                             DISSECT_IMAGE_DISCARD_ON_LOOP|DISSECT_IMAGE_RELAX_VAR_CHECK|DISSECT_IMAGE_FSCK,
                             error_path);
 
@@ -2862,7 +2879,7 @@ static int setup_keyring(
         }
 
 out:
-        /* Revert back uid & gid for the the last time, and exit */
+        /* Revert back uid & gid for the last time, and exit */
         /* no extra logging, as only the first already reported error matters */
         if (getuid() != saved_uid)
                 (void) setreuid(saved_uid, -1);
@@ -3361,6 +3378,14 @@ static int exec_child(
                 }
         }
 
+        if (context->coredump_filter_set) {
+                r = set_coredump_filter(context->coredump_filter);
+                if (ERRNO_IS_PRIVILEGE(r))
+                        log_unit_debug_errno(unit, r, "Failed to adjust coredump_filter, ignoring: %m");
+                else if (r < 0)
+                        return log_unit_error_errno(unit, r, "Failed to adjust coredump_filter: %m");
+        }
+
         if (context->nice_set) {
                 r = setpriority_closest(context->nice);
                 if (r < 0)
@@ -3770,8 +3795,16 @@ static int exec_child(
                         }
                 }
 
-                /* This is done before enforce_user, but ambient set
-                 * does not survive over setresuid() if keep_caps is not set. */
+                /* Ambient capabilities are cleared during setresuid() (in enforce_user()) even with
+                 * keep-caps set.
+                 * To be able to raise the ambient capabilities after setresuid() they have to be
+                 * added to the inherited set and keep caps has to be set (done in enforce_user()).
+                 * After setresuid() the ambient capabilities can be raised as they are present in
+                 * the permitted and inhertiable set. However it is possible that someone wants to
+                 * set ambient capabilities without changing the user, so we also set the ambient
+                 * capabilities here.
+                 * The requested ambient capabilities are raised in the inheritable set if the
+                 * second argument is true. */
                 if (!needs_ambient_hack) {
                         r = capability_ambient_set_apply(context->capability_ambient_set, true);
                         if (r < 0) {
@@ -3797,21 +3830,12 @@ static int exec_child(
                         if (!needs_ambient_hack &&
                             context->capability_ambient_set != 0) {
 
-                                /* Fix the ambient capabilities after user change. */
+                                /* Raise the ambient capabilities after user change. */
                                 r = capability_ambient_set_apply(context->capability_ambient_set, false);
                                 if (r < 0) {
                                         *exit_status = EXIT_CAPABILITIES;
                                         return log_unit_error_errno(unit, r, "Failed to apply ambient capabilities (after UID change): %m");
                                 }
-
-                                /* If we were asked to change user and ambient capabilities
-                                 * were requested, we had to add keep-caps to the securebits
-                                 * so that we would maintain the inherited capability set
-                                 * through the setresuid(). Make sure that the bit is added
-                                 * also to the context secure_bits so that we don't try to
-                                 * drop the bit away next. */
-
-                                secure_bits |= 1<<SECURE_KEEP_CAPS;
                         }
                 }
         }
@@ -3853,12 +3877,27 @@ static int exec_child(
 #endif
 
                 /* PR_GET_SECUREBITS is not privileged, while PR_SET_SECUREBITS is. So to suppress potential EPERMs
-                 * we'll try not to call PR_SET_SECUREBITS unless necessary. */
-                if (prctl(PR_GET_SECUREBITS) != secure_bits)
+                 * we'll try not to call PR_SET_SECUREBITS unless necessary. Setting securebits requires
+                 * CAP_SETPCAP. */
+                if (prctl(PR_GET_SECUREBITS) != secure_bits) {
+                        /* CAP_SETPCAP is required to set securebits. This capabilitiy is raised into the
+                         * effective set here.
+                         * The effective set is overwritten during execve  with the following  values:
+                         * - ambient set (for non-root processes)
+                         * - (inheritable | bounding) set for root processes)
+                         *
+                         * Hence there is no security impact to raise it in the effective set before execve
+                         */
+                        r = capability_gain_cap_setpcap(NULL);
+                        if (r < 0) {
+                                *exit_status = EXIT_CAPABILITIES;
+                                return log_unit_error_errno(unit, r, "Failed to gain CAP_SETPCAP for setting secure bits");
+                        }
                         if (prctl(PR_SET_SECUREBITS, secure_bits) < 0) {
                                 *exit_status = EXIT_SECUREBITS;
                                 return log_unit_error_errno(unit, errno, "Failed to set process secure bits: %m");
                         }
+                }
 
                 if (context_has_no_new_privileges(context))
                         if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
@@ -4198,6 +4237,13 @@ void exec_context_done(ExecContext *c) {
         c->working_directory = mfree(c->working_directory);
         c->root_directory = mfree(c->root_directory);
         c->root_image = mfree(c->root_image);
+        c->root_hash = mfree(c->root_hash);
+        c->root_hash_size = 0;
+        c->root_hash_path = mfree(c->root_hash_path);
+        c->root_hash_sig = mfree(c->root_hash_sig);
+        c->root_hash_sig_size = 0;
+        c->root_hash_sig_path = mfree(c->root_hash_sig_path);
+        c->root_verity = mfree(c->root_verity);
         c->tty_path = mfree(c->tty_path);
         c->syslog_identifier = mfree(c->syslog_identifier);
         c->user = mfree(c->user);
@@ -4602,6 +4648,30 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
         if (c->root_image)
                 fprintf(f, "%sRootImage: %s\n", prefix, c->root_image);
 
+        if (c->root_hash) {
+                _cleanup_free_ char *encoded = NULL;
+                encoded = hexmem(c->root_hash, c->root_hash_size);
+                if (encoded)
+                        fprintf(f, "%sRootHash: %s\n", prefix, encoded);
+        }
+
+        if (c->root_hash_path)
+                fprintf(f, "%sRootHash: %s\n", prefix, c->root_hash_path);
+
+        if (c->root_hash_sig) {
+                _cleanup_free_ char *encoded = NULL;
+                ssize_t len;
+                len = base64mem(c->root_hash_sig, c->root_hash_sig_size, &encoded);
+                if (len)
+                        fprintf(f, "%sRootHashSignature: base64:%s\n", prefix, encoded);
+        }
+
+        if (c->root_hash_sig_path)
+                fprintf(f, "%sRootHashSignature: %s\n", prefix, c->root_hash_sig_path);
+
+        if (c->root_verity)
+                fprintf(f, "%sRootVerity: %s\n", prefix, c->root_verity);
+
         STRV_FOREACH(e, c->environment)
                 fprintf(f, "%sEnvironment: %s\n", prefix, *e);
 
@@ -4636,6 +4706,11 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 fprintf(f,
                         "%sOOMScoreAdjust: %i\n",
                         prefix, c->oom_score_adjust);
+
+        if (c->coredump_filter_set)
+                fprintf(f,
+                        "%sCoredumpFilter: 0x%"PRIx64"\n",
+                        prefix, c->coredump_filter);
 
         for (i = 0; i < RLIM_NLIMITS; i++)
                 if (c->rlimit[i]) {
@@ -4725,17 +4800,13 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                         prefix, yes_no(c->tty_vt_disallocate));
 
         if (IN_SET(c->std_output,
-                   EXEC_OUTPUT_SYSLOG,
                    EXEC_OUTPUT_KMSG,
                    EXEC_OUTPUT_JOURNAL,
-                   EXEC_OUTPUT_SYSLOG_AND_CONSOLE,
                    EXEC_OUTPUT_KMSG_AND_CONSOLE,
                    EXEC_OUTPUT_JOURNAL_AND_CONSOLE) ||
             IN_SET(c->std_error,
-                   EXEC_OUTPUT_SYSLOG,
                    EXEC_OUTPUT_KMSG,
                    EXEC_OUTPUT_JOURNAL,
-                   EXEC_OUTPUT_SYSLOG_AND_CONSOLE,
                    EXEC_OUTPUT_KMSG_AND_CONSOLE,
                    EXEC_OUTPUT_JOURNAL_AND_CONSOLE)) {
 
@@ -4901,7 +4972,7 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                         "%sSystemCallFilter: ",
                         prefix);
 
-                if (!c->syscall_whitelist)
+                if (!c->syscall_allow_list)
                         fputc('~', f);
 
 #if HAVE_SECCOMP
@@ -5314,28 +5385,25 @@ static ExecRuntime* exec_runtime_free(ExecRuntime *rt, bool destroy) {
                 (void) hashmap_remove(rt->manager->exec_runtime_by_id, rt->id);
 
         /* When destroy is true, then rm_rf tmp_dir and var_tmp_dir. */
-        if (destroy && rt->tmp_dir) {
+
+        if (destroy && rt->tmp_dir && !streq(rt->tmp_dir, RUN_SYSTEMD_EMPTY)) {
                 log_debug("Spawning thread to nuke %s", rt->tmp_dir);
 
                 r = asynchronous_job(remove_tmpdir_thread, rt->tmp_dir);
-                if (r < 0) {
+                if (r < 0)
                         log_warning_errno(r, "Failed to nuke %s: %m", rt->tmp_dir);
-                        free(rt->tmp_dir);
-                }
-
-                rt->tmp_dir = NULL;
+                else
+                        rt->tmp_dir = NULL;
         }
 
-        if (destroy && rt->var_tmp_dir) {
+        if (destroy && rt->var_tmp_dir && !streq(rt->var_tmp_dir, RUN_SYSTEMD_EMPTY)) {
                 log_debug("Spawning thread to nuke %s", rt->var_tmp_dir);
 
                 r = asynchronous_job(remove_tmpdir_thread, rt->var_tmp_dir);
-                if (r < 0) {
+                if (r < 0)
                         log_warning_errno(r, "Failed to nuke %s: %m", rt->var_tmp_dir);
-                        free(rt->var_tmp_dir);
-                }
-
-                rt->var_tmp_dir = NULL;
+                else
+                        rt->var_tmp_dir = NULL;
         }
 
         rt->id = mfree(rt->id);
@@ -5349,16 +5417,22 @@ static void exec_runtime_freep(ExecRuntime **rt) {
         (void) exec_runtime_free(*rt, false);
 }
 
-static int exec_runtime_allocate(ExecRuntime **ret) {
+static int exec_runtime_allocate(ExecRuntime **ret, const char *id) {
+        _cleanup_free_ char *id_copy = NULL;
         ExecRuntime *n;
 
         assert(ret);
+
+        id_copy = strdup(id);
+        if (!id_copy)
+                return -ENOMEM;
 
         n = new(ExecRuntime, 1);
         if (!n)
                 return -ENOMEM;
 
         *n = (ExecRuntime) {
+                .id = TAKE_PTR(id_copy),
                 .netns_storage_socket = { -1, -1 },
         };
 
@@ -5369,9 +5443,9 @@ static int exec_runtime_allocate(ExecRuntime **ret) {
 static int exec_runtime_add(
                 Manager *m,
                 const char *id,
-                const char *tmp_dir,
-                const char *var_tmp_dir,
-                const int netns_storage_socket[2],
+                char **tmp_dir,
+                char **var_tmp_dir,
+                int netns_storage_socket[2],
                 ExecRuntime **ret) {
 
         _cleanup_(exec_runtime_freep) ExecRuntime *rt = NULL;
@@ -5380,51 +5454,40 @@ static int exec_runtime_add(
         assert(m);
         assert(id);
 
+        /* tmp_dir, var_tmp_dir, netns_storage_socket fds are donated on success */
+
         r = hashmap_ensure_allocated(&m->exec_runtime_by_id, &string_hash_ops);
         if (r < 0)
                 return r;
 
-        r = exec_runtime_allocate(&rt);
+        r = exec_runtime_allocate(&rt, id);
         if (r < 0)
                 return r;
-
-        rt->id = strdup(id);
-        if (!rt->id)
-                return -ENOMEM;
-
-        if (tmp_dir) {
-                rt->tmp_dir = strdup(tmp_dir);
-                if (!rt->tmp_dir)
-                        return -ENOMEM;
-
-                /* When tmp_dir is set, then we require var_tmp_dir is also set. */
-                assert(var_tmp_dir);
-                rt->var_tmp_dir = strdup(var_tmp_dir);
-                if (!rt->var_tmp_dir)
-                        return -ENOMEM;
-        }
-
-        if (netns_storage_socket) {
-                rt->netns_storage_socket[0] = netns_storage_socket[0];
-                rt->netns_storage_socket[1] = netns_storage_socket[1];
-        }
 
         r = hashmap_put(m->exec_runtime_by_id, rt->id, rt);
         if (r < 0)
                 return r;
 
+        assert(!!rt->tmp_dir == !!rt->var_tmp_dir); /* We require both to be set together */
+        rt->tmp_dir = TAKE_PTR(*tmp_dir);
+        rt->var_tmp_dir = TAKE_PTR(*var_tmp_dir);
+
+        if (netns_storage_socket) {
+                rt->netns_storage_socket[0] = TAKE_FD(netns_storage_socket[0]);
+                rt->netns_storage_socket[1] = TAKE_FD(netns_storage_socket[1]);
+        }
+
         rt->manager = m;
 
         if (ret)
                 *ret = rt;
-
         /* do not remove created ExecRuntime object when the operation succeeds. */
-        rt = NULL;
+        TAKE_PTR(rt);
         return 0;
 }
 
 static int exec_runtime_make(Manager *m, const ExecContext *c, const char *id, ExecRuntime **ret) {
-        _cleanup_free_ char *tmp_dir = NULL, *var_tmp_dir = NULL;
+        _cleanup_(namespace_cleanup_tmpdirp) char *tmp_dir = NULL, *var_tmp_dir = NULL;
         _cleanup_close_pair_ int netns_storage_socket[2] = { -1, -1 };
         int r;
 
@@ -5436,7 +5499,10 @@ static int exec_runtime_make(Manager *m, const ExecContext *c, const char *id, E
         if (!c->private_network && !c->private_tmp && !c->network_namespace_path)
                 return 0;
 
-        if (c->private_tmp) {
+        if (c->private_tmp &&
+            !(prefixed_path_strv_contains(c->inaccessible_paths, "/tmp") &&
+              (prefixed_path_strv_contains(c->inaccessible_paths, "/var/tmp") ||
+               prefixed_path_strv_contains(c->inaccessible_paths, "/var")))) {
                 r = setup_tmp_dirs(id, &tmp_dir, &var_tmp_dir);
                 if (r < 0)
                         return r;
@@ -5447,12 +5513,10 @@ static int exec_runtime_make(Manager *m, const ExecContext *c, const char *id, E
                         return -errno;
         }
 
-        r = exec_runtime_add(m, id, tmp_dir, var_tmp_dir, netns_storage_socket, ret);
+        r = exec_runtime_add(m, id, &tmp_dir, &var_tmp_dir, netns_storage_socket, ret);
         if (r < 0)
                 return r;
 
-        /* Avoid cleanup */
-        netns_storage_socket[0] = netns_storage_socket[1] = -1;
         return 1;
 }
 
@@ -5570,12 +5634,8 @@ int exec_runtime_deserialize_compat(Unit *u, const char *key, const char *value,
 
         rt = hashmap_get(u->manager->exec_runtime_by_id, u->id);
         if (!rt) {
-                r = exec_runtime_allocate(&rt_create);
+                r = exec_runtime_allocate(&rt_create, u->id);
                 if (r < 0)
-                        return log_oom();
-
-                rt_create->id = strdup(u->id);
-                if (!rt_create->id)
                         return log_oom();
 
                 rt = rt_create;
@@ -5634,15 +5694,16 @@ int exec_runtime_deserialize_compat(Unit *u, const char *key, const char *value,
                 rt_create->manager = u->manager;
 
                 /* Avoid cleanup */
-                rt_create = NULL;
+                TAKE_PTR(rt_create);
         }
 
         return 1;
 }
 
-void exec_runtime_deserialize_one(Manager *m, const char *value, FDSet *fds) {
-        char *id = NULL, *tmp_dir = NULL, *var_tmp_dir = NULL;
-        int r, fd0 = -1, fd1 = -1;
+int exec_runtime_deserialize_one(Manager *m, const char *value, FDSet *fds) {
+        _cleanup_free_ char *tmp_dir = NULL, *var_tmp_dir = NULL;
+        char *id = NULL;
+        int r, fdpair[] = {-1, -1};
         const char *p, *v = value;
         size_t n;
 
@@ -5659,7 +5720,9 @@ void exec_runtime_deserialize_one(Manager *m, const char *value, FDSet *fds) {
         v = startswith(p, "tmp-dir=");
         if (v) {
                 n = strcspn(v, " ");
-                tmp_dir = strndupa(v, n);
+                tmp_dir = strndup(v, n);
+                if (!tmp_dir)
+                        return log_oom();
                 if (v[n] != ' ')
                         goto finalize;
                 p = v + n + 1;
@@ -5668,7 +5731,9 @@ void exec_runtime_deserialize_one(Manager *m, const char *value, FDSet *fds) {
         v = startswith(p, "var-tmp-dir=");
         if (v) {
                 n = strcspn(v, " ");
-                var_tmp_dir = strndupa(v, n);
+                var_tmp_dir = strndup(v, n);
+                if (!var_tmp_dir)
+                        return log_oom();
                 if (v[n] != ' ')
                         goto finalize;
                 p = v + n + 1;
@@ -5680,11 +5745,14 @@ void exec_runtime_deserialize_one(Manager *m, const char *value, FDSet *fds) {
 
                 n = strcspn(v, " ");
                 buf = strndupa(v, n);
-                if (safe_atoi(buf, &fd0) < 0 || !fdset_contains(fds, fd0)) {
-                        log_debug("Unable to process exec-runtime netns fd specification.");
-                        return;
-                }
-                fd0 = fdset_remove(fds, fd0);
+
+                r = safe_atoi(buf, &fdpair[0]);
+                if (r < 0)
+                        return log_debug_errno(r, "Unable to parse exec-runtime specification netns-socket-0=%s: %m", buf);
+                if (!fdset_contains(fds, fdpair[0]))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EBADF),
+                                               "exec-runtime specification netns-socket-0= refers to unknown fd %d: %m", fdpair[0]);
+                fdpair[0] = fdset_remove(fds, fdpair[0]);
                 if (v[n] != ' ')
                         goto finalize;
                 p = v + n + 1;
@@ -5696,18 +5764,20 @@ void exec_runtime_deserialize_one(Manager *m, const char *value, FDSet *fds) {
 
                 n = strcspn(v, " ");
                 buf = strndupa(v, n);
-                if (safe_atoi(buf, &fd1) < 0 || !fdset_contains(fds, fd1)) {
-                        log_debug("Unable to process exec-runtime netns fd specification.");
-                        return;
-                }
-                fd1 = fdset_remove(fds, fd1);
+                r = safe_atoi(buf, &fdpair[1]);
+                if (r < 0)
+                        return log_debug_errno(r, "Unable to parse exec-runtime specification netns-socket-1=%s: %m", buf);
+                if (!fdset_contains(fds, fdpair[0]))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EBADF),
+                                               "exec-runtime specification netns-socket-1= refers to unknown fd %d: %m", fdpair[1]);
+                fdpair[1] = fdset_remove(fds, fdpair[1]);
         }
 
 finalize:
-
-        r = exec_runtime_add(m, id, tmp_dir, var_tmp_dir, (int[]) { fd0, fd1 }, NULL);
+        r = exec_runtime_add(m, id, &tmp_dir, &var_tmp_dir, fdpair, NULL);
         if (r < 0)
-                log_debug_errno(r, "Failed to add exec-runtime: %m");
+                return log_debug_errno(r, "Failed to add exec-runtime: %m");
+        return 0;
 }
 
 void exec_runtime_vacuum(Manager *m) {
@@ -5730,7 +5800,10 @@ void exec_params_clear(ExecParameters *p) {
         if (!p)
                 return;
 
-        strv_free(p->environment);
+        p->environment = strv_free(p->environment);
+        p->fd_names = strv_free(p->fd_names);
+        p->fds = mfree(p->fds);
+        p->exec_fd = safe_close(p->exec_fd);
 }
 
 static const char* const exec_input_table[_EXEC_INPUT_MAX] = {
@@ -5750,8 +5823,6 @@ static const char* const exec_output_table[_EXEC_OUTPUT_MAX] = {
         [EXEC_OUTPUT_INHERIT] = "inherit",
         [EXEC_OUTPUT_NULL] = "null",
         [EXEC_OUTPUT_TTY] = "tty",
-        [EXEC_OUTPUT_SYSLOG] = "syslog",
-        [EXEC_OUTPUT_SYSLOG_AND_CONSOLE] = "syslog+console",
         [EXEC_OUTPUT_KMSG] = "kmsg",
         [EXEC_OUTPUT_KMSG_AND_CONSOLE] = "kmsg+console",
         [EXEC_OUTPUT_JOURNAL] = "journal",

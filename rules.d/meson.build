@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: LGPL-2.1+
 
 rules = files('''
+        60-autosuspend.rules
         60-block.rules
         60-cdrom_id.rules
         60-drm.rules
@@ -14,16 +15,18 @@ rules = files('''
         60-persistent-v4l.rules
         60-sensor.rules
         60-serial.rules
-        61-autosuspend-manual.rules
         70-joystick.rules
         70-mouse.rules
         70-touchpad.rules
         75-net-description.rules
         75-probe_mtd.rules
         78-sound-card.rules
-        80-drivers.rules
         80-net-setup-link.rules
 '''.split())
+
+if conf.get('HAVE_KMOD') == 1
+        rules += files('80-drivers.rules')
+endif
 
 install_data(rules,
              install_dir : udevrulesdir)
@@ -45,11 +48,3 @@ foreach file : rules_in
                      install_dir : udevrulesdir)
         all_rules += gen
 endforeach
-
-auto_suspend_rules = custom_target(
-        '60-autosuspend-chromiumos.rules',
-        output : '60-autosuspend-chromiumos.rules',
-        command : make_autosuspend_rules_py,
-        capture : true,
-        install : true,
-        install_dir: [udevrulesdir])

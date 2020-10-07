@@ -10,6 +10,7 @@
 #include "sd-bus.h"
 
 #include "bus-common-errors.h"
+#include "bus-locator.h"
 #include "errno-util.h"
 #include "in-addr-util.h"
 #include "macro.h"
@@ -27,7 +28,8 @@ static bool bus_error_shall_fallback(sd_bus_error *e) {
                sd_bus_error_has_name(e, SD_BUS_ERROR_NO_REPLY) ||
                sd_bus_error_has_name(e, SD_BUS_ERROR_ACCESS_DENIED) ||
                sd_bus_error_has_name(e, SD_BUS_ERROR_DISCONNECTED) ||
-               sd_bus_error_has_name(e, SD_BUS_ERROR_TIMEOUT);
+               sd_bus_error_has_name(e, SD_BUS_ERROR_TIMEOUT) ||
+               sd_bus_error_has_name(e, BUS_ERROR_NO_SUCH_UNIT);
 }
 
 static int count_addresses(sd_bus_message *m, int af, const char **canonical) {
@@ -142,13 +144,7 @@ enum nss_status _nss_resolve_gethostbyname4_r(
         if (r < 0)
                 goto fail;
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &req,
-                        "org.freedesktop.resolve1",
-                        "/org/freedesktop/resolve1",
-                        "org.freedesktop.resolve1.Manager",
-                        "ResolveHostname");
+        r = bus_message_new_method_call(bus, &req, bus_resolve_mgr, "ResolveHostname");
         if (r < 0)
                 goto fail;
 
@@ -322,13 +318,7 @@ enum nss_status _nss_resolve_gethostbyname3_r(
         if (r < 0)
                 goto fail;
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &req,
-                        "org.freedesktop.resolve1",
-                        "/org/freedesktop/resolve1",
-                        "org.freedesktop.resolve1.Manager",
-                        "ResolveHostname");
+        r = bus_message_new_method_call(bus, &req, bus_resolve_mgr, "ResolveHostname");
         if (r < 0)
                 goto fail;
 
@@ -514,13 +504,7 @@ enum nss_status _nss_resolve_gethostbyaddr2_r(
         if (r < 0)
                 goto fail;
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &req,
-                        "org.freedesktop.resolve1",
-                        "/org/freedesktop/resolve1",
-                        "org.freedesktop.resolve1.Manager",
-                        "ResolveAddress");
+        r = bus_message_new_method_call(bus, &req, bus_resolve_mgr, "ResolveAddress");
         if (r < 0)
                 goto fail;
 

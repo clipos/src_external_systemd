@@ -314,7 +314,7 @@ void dns_transaction_complete(DnsTransaction *t, DnsTransactionState state) {
                            "DNS_TRANSACTION=%" PRIu16, t->id,
                            "DNS_QUESTION=%s", key_str,
                            "DNSSEC_RESULT=%s", dnssec_result_to_string(t->answer_dnssec_result),
-                           "DNS_SERVER=%s", dns_server_string(t->server),
+                           "DNS_SERVER=%s", strna(dns_server_string_full(t->server)),
                            "DNS_SERVER_FEATURE_LEVEL=%s", dns_server_feature_level_to_string(t->server->possible_feature_level));
         }
 
@@ -364,6 +364,14 @@ void dns_transaction_complete(DnsTransaction *t, DnsTransactionState state) {
         dns_transaction_gc(t);
 }
 
+static void dns_transaction_complete_errno(DnsTransaction *t, int error) {
+        assert(t);
+        assert(error != 0);
+
+        t->answer_errno = abs(error);
+        dns_transaction_complete(t, DNS_TRANSACTION_ERRNO);
+}
+
 static int dns_transaction_pick_server(DnsTransaction *t) {
         DnsServer *server;
 
@@ -398,7 +406,7 @@ static int dns_transaction_pick_server(DnsTransaction *t) {
 
         t->n_picked_servers ++;
 
-        log_debug("Using DNS server %s for transaction %u.", dns_server_string(t->server), t->id);
+        log_debug("Using DNS server %s for transaction %u.", strna(dns_server_string_full(t->server)), t->id);
 
         return 1;
 }
@@ -415,10 +423,8 @@ static void dns_transaction_retry(DnsTransaction *t, bool next_server) {
                 dns_scope_next_dns_server(t->scope);
 
         r = dns_transaction_go(t);
-        if (r < 0) {
-                t->answer_errno = -r;
-                dns_transaction_complete(t, DNS_TRANSACTION_ERRNO);
-        }
+        if (r < 0)
+                dns_transaction_complete_errno(t, r);
 }
 
 static int dns_transaction_maybe_restart(DnsTransaction *t) {
@@ -466,10 +472,8 @@ static void on_transaction_stream_error(DnsTransaction *t, int error) {
                 dns_transaction_retry(t, true);
                 return;
         }
-        if (error != 0) {
-                t->answer_errno = error;
-                dns_transaction_complete(t, DNS_TRANSACTION_ERRNO);
-        }
+        if (error != 0)
+                dns_transaction_complete_errno(t, error);
 }
 
 static int dns_transaction_on_stream_packet(DnsTransaction *t, DnsPacket *p) {
@@ -544,8 +548,10 @@ static int on_stream_packet(DnsStream *s) {
         return 0;
 }
 
-static uint16_t dns_port_for_feature_level(DnsServerFeatureLevel level) {
-        return DNS_SERVER_FEATURE_LEVEL_IS_TLS(level) ? 853 : 53;
+static uint16_t dns_transaction_port(DnsTransaction *t) {
+        if (t->server->port > 0)
+                return t->server->port;
+        return DNS_SERVER_FEATURE_LEVEL_IS_TLS(t->current_feature_level) ? 853 : 53;
 }
 
 static int dns_transaction_emit_tcp(DnsTransaction *t) {
@@ -576,7 +582,7 @@ static int dns_transaction_emit_tcp(DnsTransaction *t) {
                 if (t->server->stream && (DNS_SERVER_FEATURE_LEVEL_IS_TLS(t->current_feature_level) == t->server->stream->encrypted))
                         s = dns_stream_ref(t->server->stream);
                 else
-                        fd = dns_scope_socket_tcp(t->scope, AF_UNSPEC, NULL, t->server, dns_port_for_feature_level(t->current_feature_level), &sa);
+                        fd = dns_scope_socket_tcp(t->scope, AF_UNSPEC, NULL, t->server, dns_transaction_port(t), &sa);
 
                 type = DNS_STREAM_LOOKUP;
                 break;
@@ -834,8 +840,7 @@ static void dns_transaction_process_dnssec(DnsTransaction *t) {
         return;
 
 fail:
-        t->answer_errno = -r;
-        dns_transaction_complete(t, DNS_TRANSACTION_ERRNO);
+        dns_transaction_complete_errno(t, r);
 }
 
 static int dns_transaction_has_positive_answer(DnsTransaction *t, DnsAnswerFlags *flags) {
@@ -1167,8 +1172,7 @@ void dns_transaction_process_reply(DnsTransaction *t, DnsPacket *p) {
         return;
 
 fail:
-        t->answer_errno = -r;
-        dns_transaction_complete(t, DNS_TRANSACTION_ERRNO);
+        dns_transaction_complete_errno(t, r);
 }
 
 static int on_dns_packet(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
@@ -1194,8 +1198,7 @@ static int on_dns_packet(sd_event_source *s, int fd, uint32_t revents, void *use
                 return 0;
         }
         if (r < 0) {
-                dns_transaction_complete(t, DNS_TRANSACTION_ERRNO);
-                t->answer_errno = -r;
+                dns_transaction_complete_errno(t, r);
                 return 0;
         }
         if (r == 0)
@@ -1243,7 +1246,7 @@ static int dns_transaction_emit_udp(DnsTransaction *t) {
 
                         dns_transaction_close_connection(t);
 
-                        fd = dns_scope_socket_udp(t->scope, t->server, 53);
+                        fd = dns_scope_socket_udp(t->scope, t->server);
                         if (fd < 0)
                                 return fd;
 
@@ -1501,11 +1504,7 @@ static int dns_transaction_make_packet_mdns(DnsTransaction *t) {
                 add_known_answers = true;
 
         if (t->key->type == DNS_TYPE_ANY) {
-                r = set_ensure_allocated(&keys, &dns_resource_key_hash_ops);
-                if (r < 0)
-                        return r;
-
-                r = set_put(keys, t->key);
+                r = set_ensure_put(&keys, &dns_resource_key_hash_ops, t->key);
                 if (r < 0)
                         return r;
         }
@@ -1571,11 +1570,7 @@ static int dns_transaction_make_packet_mdns(DnsTransaction *t) {
                         add_known_answers = true;
 
                 if (other->key->type == DNS_TYPE_ANY) {
-                        r = set_ensure_allocated(&keys, &dns_resource_key_hash_ops);
-                        if (r < 0)
-                                return r;
-
-                        r = set_put(keys, other->key);
+                        r = set_ensure_put(&keys, &dns_resource_key_hash_ops, other->key);
                         if (r < 0)
                                 return r;
                 }
@@ -1800,7 +1795,7 @@ static int dns_transaction_find_cyclic(DnsTransaction *t, DnsTransaction *aux) {
 }
 
 static int dns_transaction_add_dnssec_transaction(DnsTransaction *t, DnsResourceKey *key, DnsTransaction **ret) {
-        DnsTransaction *aux;
+        _cleanup_(dns_transaction_gcp) DnsTransaction *aux = NULL;
         int r;
 
         assert(t);
@@ -1833,34 +1828,22 @@ static int dns_transaction_add_dnssec_transaction(DnsTransaction *t, DnsResource
                 }
         }
 
-        r = set_ensure_allocated(&t->dnssec_transactions, NULL);
-        if (r < 0)
-                goto gc;
-
-        r = set_ensure_allocated(&aux->notify_transactions, NULL);
-        if (r < 0)
-                goto gc;
-
         r = set_ensure_allocated(&aux->notify_transactions_done, NULL);
         if (r < 0)
-                goto gc;
+                return r;
 
-        r = set_put(t->dnssec_transactions, aux);
+        r = set_ensure_put(&t->dnssec_transactions, NULL, aux);
         if (r < 0)
-                goto gc;
+                return r;;
 
-        r = set_put(aux->notify_transactions, t);
+        r = set_ensure_put(&aux->notify_transactions, NULL, t);
         if (r < 0) {
                 (void) set_remove(t->dnssec_transactions, aux);
-                goto gc;
+                return r;
         }
 
-        *ret = aux;
+        *ret = TAKE_PTR(aux);
         return 1;
-
-gc:
-        dns_transaction_gc(aux);
-        return r;
 }
 
 static int dns_transaction_request_dnssec_rr(DnsTransaction *t, DnsResourceKey *key) {

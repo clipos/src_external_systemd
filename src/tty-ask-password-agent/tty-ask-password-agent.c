@@ -47,7 +47,7 @@ static enum {
         ACTION_LIST,
         ACTION_QUERY,
         ACTION_WATCH,
-        ACTION_WALL
+        ACTION_WALL,
 } arg_action = ACTION_QUERY;
 
 static bool arg_plymouth = false;
@@ -143,8 +143,7 @@ static int agent_ask_password_tty(
                 const char *flag_file,
                 char ***ret) {
 
-        int tty_fd = -1;
-        int r;
+        int tty_fd = -1, r;
 
         if (arg_console) {
                 const char *con = arg_device ?: "/dev/console";
@@ -166,7 +165,7 @@ static int agent_ask_password_tty(
                 release_terminal();
         }
 
-        return 0;
+        return r;
 }
 
 static int process_one_password_file(const char *filename) {
@@ -192,7 +191,9 @@ static int process_one_password_file(const char *filename) {
         r = config_parse(NULL, filename, NULL,
                          NULL,
                          config_item_table_lookup, items,
-                         CONFIG_PARSE_RELAXED|CONFIG_PARSE_WARN, NULL);
+                         CONFIG_PARSE_RELAXED|CONFIG_PARSE_WARN,
+                         NULL,
+                         NULL);
         if (r < 0)
                 return r;
 
@@ -208,7 +209,7 @@ static int process_one_password_file(const char *filename) {
 
         switch (arg_action) {
         case ACTION_LIST:
-                printf("'%s' (PID %u)\n", message, pid);
+                printf("'%s' (PID %u)\n", strna(message), pid);
                 return 0;
 
         case ACTION_WALL: {
@@ -217,7 +218,7 @@ static int process_one_password_file(const char *filename) {
                  if (asprintf(&wall,
                               "Password entry required for \'%s\' (PID %u).\r\n"
                               "Please enter password with the systemd-tty-ask-password-agent tool.",
-                              message,
+                              strna(message),
                               pid) < 0)
                          return log_oom();
 
@@ -231,7 +232,7 @@ static int process_one_password_file(const char *filename) {
 
                 if (access(socket_name, W_OK) < 0) {
                         if (arg_action == ACTION_QUERY)
-                                log_info("Not querying '%s' (PID %u), lacking privileges.", message, pid);
+                                log_info("Not querying '%s' (PID %u), lacking privileges.", strna(message), pid);
 
                         return 0;
                 }
@@ -244,7 +245,6 @@ static int process_one_password_file(const char *filename) {
                         r = ask_password_plymouth(message, not_after, flags, filename, &passwords);
                 else
                         r = agent_ask_password_tty(message, not_after, flags, filename, &passwords);
-
                 if (r < 0) {
                         /* If the query went away, that's OK */
                         if (IN_SET(r, -ETIME, -ENOENT))
@@ -260,8 +260,7 @@ static int process_one_password_file(const char *filename) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to send: %m");
                 break;
-        }
-        }
+        }}
 
         return 0;
 }
@@ -392,6 +391,10 @@ static int process_and_watch_password_files(bool watch) {
 
                         return -errno;
                 }
+
+                if (pollfd[FD_SIGNAL].revents & POLLNVAL ||
+                    pollfd[FD_INOTIFY].revents & POLLNVAL)
+                        return -EBADF;
 
                 if (pollfd[FD_INOTIFY].revents != 0)
                         (void) flush_fd(notify);
@@ -707,7 +710,7 @@ static int run(int argc, char *argv[]) {
                 (void) release_terminal();
         }
 
-        return process_and_watch_password_files(arg_action != ACTION_QUERY);
+        return process_and_watch_password_files(!IN_SET(arg_action, ACTION_QUERY, ACTION_LIST));
 }
 
 DEFINE_MAIN_FUNCTION(run);

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <sys/stat.h>
 
 #include "sd-bus.h"
 #include "sd-device.h"
@@ -120,8 +121,15 @@ struct Manager {
         sd_event_source *lid_switch_ignore_event_source;
 
         uint64_t runtime_dir_size;
+        uint64_t runtime_dir_inodes;
         uint64_t sessions_max;
         uint64_t inhibitors_max;
+
+        char **efi_boot_loader_entries;
+        bool efi_boot_loader_entries_set;
+
+        char *efi_loader_entry_one_shot;
+        struct stat efi_loader_entry_one_shot_stat;
 };
 
 void manager_reset_config(Manager *m);
@@ -157,8 +165,6 @@ int manager_read_utmp(Manager *m);
 void manager_connect_utmp(Manager *m);
 void manager_reconnect_utmp(Manager *m);
 
-extern const sd_bus_vtable manager_vtable[];
-
 /* gperf lookup function */
 const struct ConfigPerfItem* logind_gperf_lookup(const char *key, GPERF_LEN_TYPE length);
 
@@ -169,3 +175,5 @@ CONFIG_PARSER_PROTOTYPE(config_parse_tmpfs_size);
 
 int manager_setup_wall_message_timer(Manager *m);
 bool logind_wall_tty_filter(const char *tty, void *userdata);
+
+int manager_read_efi_boot_loader_entries(Manager *m);

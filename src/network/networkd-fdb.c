@@ -218,7 +218,7 @@ int config_parse_fdb_hwaddr(
 
         r = ether_addr_from_string(rvalue, &fdb_entry->mac_addr);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Not a valid MAC address, ignoring assignment: %s", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Not a valid MAC address, ignoring assignment: %s", rvalue);
                 return 0;
         }
 
@@ -292,10 +292,12 @@ int config_parse_fdb_destination(
                 return log_oom();
 
         r = in_addr_from_string_auto(rvalue, &fdb_entry->family, &fdb_entry->destination_addr);
-        if (r < 0)
-                return log_syntax(unit, LOG_ERR, filename, line, r,
-                                  "FDB destination IP address is invalid, ignoring assignment: %s",
-                                  rvalue);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "FDB destination IP address is invalid, ignoring assignment: %s",
+                           rvalue);
+                return 0;
+        }
 
         fdb_entry = NULL;
 
@@ -331,14 +333,14 @@ int config_parse_fdb_vxlan_vni(
 
         r = safe_atou32(rvalue, &vni);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r,
+                log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse VXLAN Network Identifier (VNI), ignoring assignment: %s",
                            rvalue);
                 return 0;
         }
 
         if (vni > VXLAN_VID_MAX) {
-                log_syntax(unit, LOG_ERR, filename, line, 0,
+                log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "FDB invalid VXLAN Network Identifier (VNI), ignoring assignment: %s",
                            rvalue);
                 return 0;
@@ -379,7 +381,7 @@ int config_parse_fdb_ntf_flags(
 
         f = fdb_ntf_flags_from_string(rvalue);
         if (f < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, 0,
+                log_syntax(unit, LOG_WARNING, filename, line, SYNTHETIC_ERRNO(EINVAL),
                            "FDB failed to parse AssociatedWith=, ignoring assignment: %s",
                            rvalue);
                 return 0;

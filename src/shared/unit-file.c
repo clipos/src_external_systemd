@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 
+#include "sd-id128.h"
+
 #include "dirent-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
@@ -199,9 +201,14 @@ static bool lookup_paths_mtime_exclude(const LookupPaths *lp, const char *path) 
                streq_ptr(path, lp->runtime_control);
 }
 
-static bool lookup_paths_mtime_good(const LookupPaths *lp, usec_t mtime) {
-        char **dir;
+#define HASH_KEY SD_ID128_MAKE(4e,86,1b,e3,39,b3,40,46,98,5d,b8,11,34,8f,c3,c1)
 
+bool lookup_paths_timestamp_hash_same(const LookupPaths *lp, uint64_t timestamp_hash, uint64_t *ret_new) {
+        struct siphash state;
+
+        siphash24_init(&state, HASH_KEY.bytes);
+
+        char **dir;
         STRV_FOREACH(dir, (char**) lp->search_path) {
                 struct stat st;
 
@@ -217,21 +224,23 @@ static bool lookup_paths_mtime_good(const LookupPaths *lp, usec_t mtime) {
                         continue;
                 }
 
-                if (timespec_load(&st.st_mtim) > mtime) {
-                        log_debug_errno(errno, "Unit dir %s has changed, need to update cache.", *dir);
-                        return false;
-                }
+                siphash24_compress_usec_t(timespec_load(&st.st_mtim), &state);
         }
 
-        return true;
+        uint64_t updated = siphash24_finalize(&state);
+        if (ret_new)
+                *ret_new = updated;
+        if (updated != timestamp_hash)
+                log_debug("Modification times have changed, need to update cache.");
+        return updated == timestamp_hash;
 }
 
 int unit_file_build_name_map(
                 const LookupPaths *lp,
-                usec_t *cache_mtime,
-                Hashmap **ret_unit_ids_map,
-                Hashmap **ret_unit_names_map,
-                Set **ret_path_cache) {
+                uint64_t *cache_timestamp_hash,
+                Hashmap **unit_ids_map,
+                Hashmap **unit_names_map,
+                Set **path_cache) {
 
         /* Build two mappings: any name → main unit (i.e. the end result of symlink resolution), unit name →
          * all aliases (i.e. the entry for a given key is a a list of all names which point to this key). The
@@ -239,22 +248,27 @@ int unit_file_build_name_map(
          * have a key, but it is not present in the value for itself, there was an alias pointing to it, but
          * the unit itself is not loadable.
          *
-         * At the same, build a cache of paths where to find units.
+         * At the same, build a cache of paths where to find units. The non-const parameters are for input
+         * and output. Existing contents will be freed before the new contents are stored.
          */
 
         _cleanup_hashmap_free_ Hashmap *ids = NULL, *names = NULL;
         _cleanup_set_free_free_ Set *paths = NULL;
+        uint64_t timestamp_hash;
         char **dir;
         int r;
-        usec_t mtime = 0;
 
-        /* Before doing anything, check if the mtime that was passed is still valid. If
-         * yes, do nothing. If *cache_time == 0, always build the cache. */
-        if (cache_mtime && *cache_mtime > 0 && lookup_paths_mtime_good(lp, *cache_mtime))
-                return 0;
+        /* Before doing anything, check if the timestamp hash that was passed is still valid.
+         * If yes, do nothing. */
+        if (cache_timestamp_hash &&
+            lookup_paths_timestamp_hash_same(lp, *cache_timestamp_hash, &timestamp_hash))
+                        return 0;
 
-        if (ret_path_cache) {
-                paths = set_new(&path_hash_ops);
+        /* The timestamp hash is now set based on the mtimes from before when we start reading files.
+         * If anything is modified concurrently, we'll consider the cache outdated. */
+
+        if (path_cache) {
+                paths = set_new(&path_hash_ops_free);
                 if (!paths)
                         return log_oom();
         }
@@ -262,7 +276,6 @@ int unit_file_build_name_map(
         STRV_FOREACH(dir, (char**) lp->search_path) {
                 struct dirent *de;
                 _cleanup_closedir_ DIR *d = NULL;
-                struct stat st;
 
                 d = opendir(*dir);
                 if (!d) {
@@ -270,13 +283,6 @@ int unit_file_build_name_map(
                                 log_warning_errno(errno, "Failed to open \"%s\", ignoring: %m", *dir);
                         continue;
                 }
-
-                /* Determine the latest lookup path modification time */
-                if (fstat(dirfd(d), &st) < 0)
-                        return log_error_errno(errno, "Failed to fstat %s: %m", *dir);
-
-                if (!lookup_paths_mtime_exclude(lp, *dir))
-                        mtime = MAX(mtime, timespec_load(&st.st_mtim));
 
                 FOREACH_DIRENT_ALL(de, d, log_warning_errno(errno, "Failed to read \"%s\", ignoring: %m", *dir)) {
                         char *filename;
@@ -296,7 +302,7 @@ int unit_file_build_name_map(
                         if (!filename)
                                 return log_oom();
 
-                        if (ret_path_cache) {
+                        if (paths) {
                                 r = set_consume(paths, filename);
                                 if (r < 0)
                                         return log_oom();
@@ -416,12 +422,13 @@ int unit_file_build_name_map(
                                                  basename(dst), src);
         }
 
-        if (cache_mtime)
-                *cache_mtime = mtime;
-        *ret_unit_ids_map = TAKE_PTR(ids);
-        *ret_unit_names_map = TAKE_PTR(names);
-        if (ret_path_cache)
-                *ret_path_cache = TAKE_PTR(paths);
+        if (cache_timestamp_hash)
+                *cache_timestamp_hash = timestamp_hash;
+
+        hashmap_free_and_replace(*unit_ids_map, ids);
+        hashmap_free_and_replace(*unit_names_map, names);
+        if (path_cache)
+                set_free_and_replace(*path_cache, paths);
 
         return 1;
 }
@@ -463,7 +470,7 @@ int unit_file_find_fragment(
 
         /* The unit always has its own name if it's not a template. */
         if (IN_SET(name_type, UNIT_NAME_PLAIN, UNIT_NAME_INSTANCE)) {
-                r = set_put_strdup(names, unit_name);
+                r = set_put_strdup(&names, unit_name);
                 if (r < 0)
                         return r;
         }
@@ -493,7 +500,7 @@ int unit_file_find_fragment(
                                 if (!streq(unit_name, *t))
                                         log_debug("%s: %s has alias %s", __func__, unit_name, *t);
 
-                                r = set_put_strdup(names, *t);
+                                r = set_put_strdup(&names, *t);
                         }
                         if (r < 0)
                                 return r;

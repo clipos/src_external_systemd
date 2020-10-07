@@ -160,6 +160,31 @@ int btrfs_subvol_make(const char *path) {
         return btrfs_subvol_make_fd(fd, subvolume);
 }
 
+int btrfs_subvol_make_fallback(const char *path, mode_t mode) {
+        mode_t old, combined;
+        int r;
+
+        assert(path);
+
+        /* Let's work like mkdir(), i.e. take the specified mode, and mask it with the current umask. */
+        old = umask(~mode);
+        combined = old | ~mode;
+        if (combined != ~mode)
+                umask(combined);
+        r = btrfs_subvol_make(path);
+        umask(old);
+
+        if (r >= 0)
+                return 1; /* subvol worked */
+        if (r != -ENOTTY)
+                return r;
+
+        if (mkdir(path, mode) < 0)
+                return -errno;
+
+        return 0; /* plain directory */
+}
+
 int btrfs_subvol_set_read_only_fd(int fd, bool b) {
         uint64_t flags, nflags;
         struct stat st;
@@ -175,11 +200,7 @@ int btrfs_subvol_set_read_only_fd(int fd, bool b) {
         if (ioctl(fd, BTRFS_IOC_SUBVOL_GETFLAGS, &flags) < 0)
                 return -errno;
 
-        if (b)
-                nflags = flags | BTRFS_SUBVOL_RDONLY;
-        else
-                nflags = flags & ~BTRFS_SUBVOL_RDONLY;
-
+        nflags = UPDATE_FLAG(flags, BTRFS_SUBVOL_RDONLY, b);
         if (flags == nflags)
                 return 0;
 
@@ -294,11 +315,20 @@ int btrfs_get_block_device_fd(int fd, dev_t *dev) {
                         return -errno;
                 }
 
+                /* For the root fs — when no initrd is involved — btrfs returns /dev/root on any kernels from
+                 * the past few years. That sucks, as we have no API to determine the actual root then. let's
+                 * return an recognizable error for this case, so that the caller can maybe print a nice
+                 * message about this.
+                 *
+                 * https://bugzilla.kernel.org/show_bug.cgi?id=89721 */
+                if (path_equal((char*) di.path, "/dev/root"))
+                        return -EUCLEAN;
+
                 if (stat((char*) di.path, &st) < 0)
                         return -errno;
 
                 if (!S_ISBLK(st.st_mode))
-                        return -ENODEV;
+                        return -ENOTBLK;
 
                 if (major(st.st_rdev) == 0)
                         return -ENODEV;
@@ -906,9 +936,12 @@ static int qgroup_create_or_destroy(int fd, bool b, uint64_t qgroupid) {
         for (c = 0;; c++) {
                 if (ioctl(fd, BTRFS_IOC_QGROUP_CREATE, &args) < 0) {
 
-                        /* If quota is not enabled, we get EINVAL. Turn this into a recognizable error */
-                        if (errno == EINVAL)
-                                return -ENOPROTOOPT;
+                        /* On old kernels if quota is not enabled, we get EINVAL. On newer kernels we get
+                         * ENOTCONN. Let's always convert this to ENOTCONN to make this recognizable
+                         * everywhere the same way. */
+
+                        if (IN_SET(errno, EINVAL, ENOTCONN))
+                                return -ENOTCONN;
 
                         if (errno == EBUSY && c < 10) {
                                 (void) btrfs_quota_scan_wait(fd);
@@ -1128,7 +1161,6 @@ static int subvol_remove_children(int fd, const char *subvolume, uint64_t subvol
                 FOREACH_BTRFS_IOCTL_SEARCH_HEADER(i, sh, args) {
                         _cleanup_free_ char *p = NULL;
                         const struct btrfs_root_ref *ref;
-                        struct btrfs_ioctl_ino_lookup_args ino_args;
 
                         btrfs_ioctl_search_args_set(&args, sh);
 
@@ -1143,9 +1175,10 @@ static int subvol_remove_children(int fd, const char *subvolume, uint64_t subvol
                         if (!p)
                                 return -ENOMEM;
 
-                        zero(ino_args);
-                        ino_args.treeid = subvol_id;
-                        ino_args.objectid = htole64(ref->dirid);
+                        struct btrfs_ioctl_ino_lookup_args ino_args = {
+                                .treeid = subvol_id,
+                                .objectid = htole64(ref->dirid),
+                        };
 
                         if (ioctl(fd, BTRFS_IOC_INO_LOOKUP, &ino_args) < 0)
                                 return -errno;
@@ -1483,7 +1516,6 @@ static int subvol_snapshot_children(
 
                 FOREACH_BTRFS_IOCTL_SEARCH_HEADER(i, sh, args) {
                         _cleanup_free_ char *p = NULL, *c = NULL, *np = NULL;
-                        struct btrfs_ioctl_ino_lookup_args ino_args;
                         const struct btrfs_root_ref *ref;
                         _cleanup_close_ int old_child_fd = -1, new_child_fd = -1;
 
@@ -1507,9 +1539,10 @@ static int subvol_snapshot_children(
                         if (!p)
                                 return -ENOMEM;
 
-                        zero(ino_args);
-                        ino_args.treeid = old_subvol_id;
-                        ino_args.objectid = htole64(ref->dirid);
+                        struct btrfs_ioctl_ino_lookup_args ino_args = {
+                                .treeid = old_subvol_id,
+                                .objectid = htole64(ref->dirid),
+                        };
 
                         if (ioctl(old_fd, BTRFS_IOC_INO_LOOKUP, &ino_args) < 0)
                                 return -errno;

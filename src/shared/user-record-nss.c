@@ -5,6 +5,7 @@
 #include "libcrypt-util.h"
 #include "strv.h"
 #include "user-record-nss.h"
+#include "user-util.h"
 
 #define SET_IF(field, condition, value, fallback)  \
         field = (condition) ? (value) : (fallback)
@@ -34,10 +35,25 @@ int nss_passwd_to_user_record(
         if (r < 0)
                 return r;
 
-        r = free_and_strdup(&hr->real_name,
-                            streq_ptr(pwd->pw_gecos, hr->user_name) ? NULL : empty_to_null(pwd->pw_gecos));
-        if (r < 0)
-                return r;
+        /* Some bad NSS modules synthesize GECOS fields with embedded ":" or "\n" characters, which are not
+         * something we can output in /etc/passwd compatible format, since these are record separators
+         * there. We normally refuse that, but we need to maintain compatibility with arbitrary NSS modules,
+         * hence let's do what glibc does: mangle the data to fit the format. */
+        if (isempty(pwd->pw_gecos) || streq_ptr(pwd->pw_gecos, hr->user_name))
+                hr->real_name = mfree(hr->real_name);
+        else if (valid_gecos(pwd->pw_gecos)) {
+                r = free_and_strdup(&hr->real_name, pwd->pw_gecos);
+                if (r < 0)
+                        return r;
+        } else {
+                _cleanup_free_ char *mangled = NULL;
+
+                mangled = mangle_gecos(pwd->pw_gecos);
+                if (!mangled)
+                        return -ENOMEM;
+
+                free_and_replace(hr->real_name, mangled);
+        }
 
         r = free_and_strdup(&hr->home_directory, empty_to_null(pwd->pw_dir));
         if (r < 0)
@@ -50,7 +66,7 @@ int nss_passwd_to_user_record(
         hr->uid = pwd->pw_uid;
         hr->gid = pwd->pw_gid;
 
-        if (spwd && hashed_password_valid(spwd->sp_pwdp)) {
+        if (spwd && looks_like_hashed_password(spwd->sp_pwdp)) {
                 strv_free_erase(hr->hashed_password);
                 hr->hashed_password = strv_new(spwd->sp_pwdp);
                 if (!hr->hashed_password)
@@ -161,12 +177,16 @@ int nss_spwd_for_passwd(const struct passwd *pwd, struct spwd *ret_spwd, char **
         }
 }
 
-int nss_user_record_by_name(const char *name, UserRecord **ret) {
+int nss_user_record_by_name(
+                const char *name,
+                bool with_shadow,
+                UserRecord **ret) {
+
         _cleanup_free_ char *buf = NULL, *sbuf = NULL;
         struct passwd pwd, *result;
         bool incomplete = false;
         size_t buflen = 4096;
-        struct spwd spwd;
+        struct spwd spwd, *sresult = NULL;
         int r;
 
         assert(name);
@@ -197,13 +217,17 @@ int nss_user_record_by_name(const char *name, UserRecord **ret) {
                 buf = mfree(buf);
         }
 
-        r = nss_spwd_for_passwd(result, &spwd, &sbuf);
-        if (r < 0) {
-                log_debug_errno(r, "Failed to do shadow lookup for user %s, ignoring: %m", name);
-                incomplete = ERRNO_IS_PRIVILEGE(r);
-        }
+        if (with_shadow) {
+                r = nss_spwd_for_passwd(result, &spwd, &sbuf);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to do shadow lookup for user %s, ignoring: %m", name);
+                        incomplete = ERRNO_IS_PRIVILEGE(r);
+                } else
+                        sresult = &spwd;
+        } else
+                incomplete = true;
 
-        r = nss_passwd_to_user_record(result, r >= 0 ? &spwd : NULL, ret);
+        r = nss_passwd_to_user_record(result, sresult, ret);
         if (r < 0)
                 return r;
 
@@ -211,12 +235,16 @@ int nss_user_record_by_name(const char *name, UserRecord **ret) {
         return 0;
 }
 
-int nss_user_record_by_uid(uid_t uid, UserRecord **ret) {
+int nss_user_record_by_uid(
+                uid_t uid,
+                bool with_shadow,
+                UserRecord **ret) {
+
         _cleanup_free_ char *buf = NULL, *sbuf = NULL;
         struct passwd pwd, *result;
         bool incomplete = false;
         size_t buflen = 4096;
-        struct spwd spwd;
+        struct spwd spwd, *sresult = NULL;
         int r;
 
         assert(ret);
@@ -245,13 +273,17 @@ int nss_user_record_by_uid(uid_t uid, UserRecord **ret) {
                 buf = mfree(buf);
         }
 
-        r = nss_spwd_for_passwd(result, &spwd, &sbuf);
-        if (r < 0) {
-                log_debug_errno(r, "Failed to do shadow lookup for UID " UID_FMT ", ignoring: %m", uid);
-                incomplete = ERRNO_IS_PRIVILEGE(r);
-        }
+        if (with_shadow)  {
+                r = nss_spwd_for_passwd(result, &spwd, &sbuf);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to do shadow lookup for UID " UID_FMT ", ignoring: %m", uid);
+                        incomplete = ERRNO_IS_PRIVILEGE(r);
+                } else
+                        sresult = &spwd;
+        } else
+                incomplete = true;
 
-        r = nss_passwd_to_user_record(result, r >= 0 ? &spwd : NULL, ret);
+        r = nss_passwd_to_user_record(result, sresult, ret);
         if (r < 0)
                 return r;
 

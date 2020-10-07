@@ -77,7 +77,7 @@ enum {
         META_ARGV_UID,          /* %u: as seen in the initial user namespace */
         META_ARGV_GID,          /* %g: as seen in the initial user namespace */
         META_ARGV_SIGNAL,       /* %s: number of signal causing dump */
-        META_ARGV_TIMESTAMP,    /* %t: time of dump, expressed as seconds since the Epoch */
+        META_ARGV_TIMESTAMP,    /* %t: time of dump, expressed as seconds since the Epoch (we expand this to µs granularity) */
         META_ARGV_RLIMIT,       /* %c: core file size soft resource limit */
         META_ARGV_HOSTNAME,     /* %h: hostname */
         _META_ARGV_MAX,
@@ -155,11 +155,14 @@ static int parse_config(void) {
                 {}
         };
 
-        return config_parse_many_nulstr(PKGSYSCONFDIR "/coredump.conf",
-                                        CONF_PATHS_NULSTR("systemd/coredump.conf.d"),
-                                        "Coredump\0",
-                                        config_item_table_lookup, items,
-                                        CONFIG_PARSE_WARN, NULL);
+        return config_parse_many_nulstr(
+                        PKGSYSCONFDIR "/coredump.conf",
+                        CONF_PATHS_NULSTR("systemd/coredump.conf.d"),
+                        "Coredump\0",
+                        config_item_table_lookup, items,
+                        CONFIG_PARSE_WARN,
+                        NULL,
+                        NULL);
 }
 
 static uint64_t storage_size_max(void) {
@@ -174,38 +177,18 @@ static uint64_t storage_size_max(void) {
 static int fix_acl(int fd, uid_t uid) {
 
 #if HAVE_ACL
-        _cleanup_(acl_freep) acl_t acl = NULL;
-        acl_entry_t entry;
-        acl_permset_t permset;
         int r;
 
         assert(fd >= 0);
+        assert(uid_is_valid(uid));
 
         if (uid_is_system(uid) || uid_is_dynamic(uid) || uid == UID_NOBODY)
                 return 0;
 
-        /* Make sure normal users can read (but not write or delete)
-         * their own coredumps */
-
-        acl = acl_get_fd(fd);
-        if (!acl)
-                return log_error_errno(errno, "Failed to get ACL: %m");
-
-        if (acl_create_entry(&acl, &entry) < 0 ||
-            acl_set_tag_type(entry, ACL_USER) < 0 ||
-            acl_set_qualifier(entry, &uid) < 0)
-                return log_error_errno(errno, "Failed to patch ACL: %m");
-
-        if (acl_get_permset(entry, &permset) < 0 ||
-            acl_add_perm(permset, ACL_READ) < 0)
-                return log_warning_errno(errno, "Failed to patch ACL: %m");
-
-        r = calc_acl_mask_if_needed(&acl);
+        /* Make sure normal users can read (but not write or delete) their own coredumps */
+        r = add_acls_for_user(fd, uid);
         if (r < 0)
-                return log_warning_errno(r, "Failed to patch ACL: %m");
-
-        if (acl_set_fd(fd, acl) < 0)
-                return log_error_errno(errno, "Failed to apply ACL: %m");
+                return log_error_errno(r, "Failed to adjust ACL of coredump: %m");
 #endif
 
         return 0;
@@ -328,7 +311,7 @@ static int make_filename(const Context *context, char **ret) {
                 return -ENOMEM;
 
         if (asprintf(ret,
-                     "/var/lib/systemd/coredump/core.%s.%s." SD_ID128_FORMAT_STR ".%s.%s000000",
+                     "/var/lib/systemd/coredump/core.%s.%s." SD_ID128_FORMAT_STR ".%s.%s",
                      c,
                      u,
                      SD_ID128_FORMAT_VAL(boot),
@@ -420,7 +403,7 @@ static int save_external_coredump(
                 goto fail;
         }
 
-#if HAVE_XZ || HAVE_LZ4
+#if HAVE_COMPRESSION
         /* If we will remove the coredump anyway, do not compress. */
         if (arg_compress && !maybe_remove_external_coredump(NULL, st.st_size)) {
 
@@ -560,7 +543,7 @@ static int compose_open_fds(pid_t pid, char **open_fds) {
         FOREACH_DIRENT(dent, proc_fd_dir, return -errno) {
                 _cleanup_fclose_ FILE *fdinfo = NULL;
                 _cleanup_free_ char *fdname = NULL;
-                int fd;
+                _cleanup_close_ int fd = -1;
 
                 r = readlinkat_malloc(dirfd(proc_fd_dir), dent->d_name, &fdname);
                 if (r < 0)
@@ -574,11 +557,9 @@ static int compose_open_fds(pid_t pid, char **open_fds) {
                 if (fd < 0)
                         continue;
 
-                fdinfo = fdopen(fd, "r");
-                if (!fdinfo) {
-                        safe_close(fd);
+                fdinfo = take_fdopen(&fd, "r");
+                if (!fdinfo)
                         continue;
-                }
 
                 for (;;) {
                         _cleanup_free_ char *line = NULL;
@@ -886,10 +867,7 @@ static int process_socket(int fd) {
         log_debug("Processing coredump received on stdin...");
 
         for (;;) {
-                union {
-                        struct cmsghdr cmsghdr;
-                        uint8_t buf[CMSG_SPACE(sizeof(int))];
-                } control = {};
+                CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(int))) control;
                 struct msghdr mh = {
                         .msg_control = &control,
                         .msg_controllen = sizeof(control),
@@ -923,19 +901,11 @@ static int process_socket(int fd) {
                 /* The final zero-length datagram carries the file descriptor and tells us
                  * that we're done. */
                 if (n == 0) {
-                        struct cmsghdr *cmsg, *found = NULL;
+                        struct cmsghdr *found;
 
                         free(iovec.iov_base);
 
-                        CMSG_FOREACH(cmsg, &mh) {
-                                if (cmsg->cmsg_level == SOL_SOCKET &&
-                                    cmsg->cmsg_type == SCM_RIGHTS &&
-                                    cmsg->cmsg_len == CMSG_LEN(sizeof(int))) {
-                                        assert(!found);
-                                        found = cmsg;
-                                }
-                        }
-
+                        found = cmsg_find(&mh, SOL_SOCKET, SCM_RIGHTS, CMSG_LEN(sizeof(int)));
                         if (!found) {
                                 cmsg_close_all(&mh);
                                 r = log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
@@ -1046,8 +1016,11 @@ static int send_iovec(const struct iovec_wrapper *iovw, int input_fd) {
         return 0;
 }
 
-static int gather_pid_metadata_from_argv(struct iovec_wrapper *iovw, Context *context,
-                                         int argc, char **argv) {
+static int gather_pid_metadata_from_argv(
+                struct iovec_wrapper *iovw,
+                Context *context,
+                int argc, char **argv) {
+
         _cleanup_free_ char *free_timestamp = NULL;
         int i, r, signo;
         char *t;
@@ -1065,6 +1038,7 @@ static int gather_pid_metadata_from_argv(struct iovec_wrapper *iovw, Context *co
                 t = argv[i];
 
                 switch (i) {
+
                 case META_ARGV_TIMESTAMP:
                         /* The journal fields contain the timestamp padded with six
                          * zeroes, so that the kernel-supplied 1s granularity timestamps
@@ -1074,12 +1048,14 @@ static int gather_pid_metadata_from_argv(struct iovec_wrapper *iovw, Context *co
                         if (!t)
                                 return log_oom();
                         break;
+
                 case META_ARGV_SIGNAL:
                         /* For signal, record its pretty name too */
                         if (safe_atoi(argv[i], &signo) >= 0 && SIGNAL_VALID(signo))
                                 (void) iovw_put_string_field(iovw, "COREDUMP_SIGNAL_NAME=SIG",
                                                              signal_to_string(signo));
                         break;
+
                 default:
                         break;
                 }

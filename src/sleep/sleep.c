@@ -17,12 +17,14 @@
 #include "sd-messages.h"
 
 #include "btrfs-util.h"
+#include "bus-common-errors.h"
 #include "bus-error.h"
 #include "def.h"
 #include "exec-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
+#include "io-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "parse-util.h"
@@ -70,7 +72,7 @@ static int write_hibernate_location_info(const HibernateLocation *hibernate_loca
                         return 0;
                 }
 
-                return log_debug_errno(errno, "/sys/power/resume_offset not writeable: %m");
+                return log_debug_errno(errno, "/sys/power/resume_offset not writable: %m");
         }
 
         xsprintf(offset_str, "%" PRIu64, hibernate_location->offset);
@@ -160,10 +162,9 @@ static int lock_all_homes(void) {
         r = sd_bus_call(bus, m, DEFAULT_TIMEOUT_USEC, &error, NULL);
         if (r < 0) {
                 if (sd_bus_error_has_name(&error, SD_BUS_ERROR_SERVICE_UNKNOWN) ||
-                    sd_bus_error_has_name(&error, SD_BUS_ERROR_NAME_HAS_NO_OWNER)) {
-                        log_debug("systemd-homed is not running, skipping locking of home directories.");
-                        return 0;
-                }
+                    sd_bus_error_has_name(&error, SD_BUS_ERROR_NAME_HAS_NO_OWNER) ||
+                    sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_UNIT))
+                        return log_debug("systemd-homed is not running, skipping locking of home directories.");
 
                 return log_error_errno(r, "Failed to lock home directories: %s", bus_error_message(&error, r));
         }
@@ -244,7 +245,6 @@ static int execute_s2h(const SleepConfig *sleep_config) {
         _cleanup_close_ int tfd = -1;
         char buf[FORMAT_TIMESPAN_MAX];
         struct itimerspec ts = {};
-        struct pollfd fds;
         int r;
 
         assert(sleep_config);
@@ -266,18 +266,13 @@ static int execute_s2h(const SleepConfig *sleep_config) {
         if (r < 0)
                 return r;
 
-        fds = (struct pollfd) {
-                .fd = tfd,
-                .events = POLLIN,
-        };
-        r = poll(&fds, 1, 0);
+        r = fd_wait_for_event(tfd, POLLIN, 0);
         if (r < 0)
-                return log_error_errno(errno, "Error polling timerfd: %m");
+                return log_error_errno(r, "Error polling timerfd: %m");
+        if (!FLAGS_SET(r, POLLIN)) /* We woke up before the alarm time, we are done. */
+                return 0;
 
         tfd = safe_close(tfd);
-
-        if (!FLAGS_SET(fds.revents, POLLIN)) /* We woke up before the alarm time, we are done. */
-                return 0;
 
         /* If woken up after alarm time, hibernate */
         log_debug("Attempting to hibernate after waking from %s timer",
